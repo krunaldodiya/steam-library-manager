@@ -2,6 +2,7 @@
  * Steam Library Manager - Dedicated In-Steam Frontend Plugin
  * Standalone Extension for Steam Client with Draggable Floating Button
  * Universal Steam Game Support (Official Purchased & LuaTools/SLSsteam Managed)
+ * 100% In-DOM Interactive Controls (Zero window.confirm/prompt/alert for CEF compatibility)
  */
 
 (function () {
@@ -259,7 +260,7 @@
       btnExportSel.addEventListener("click", async () => {
         const selected = Array.from(tbody.querySelectorAll(".slm-gchk:checked")).map(c => parseInt(c.value));
         if (selected.length === 0) {
-          alert("Please select at least one game to backup.");
+          showToast("Please select at least one game to backup.");
           return;
         }
         btnExportSel.disabled = true;
@@ -269,7 +270,7 @@
           showToast(`✓ Backed up ${res.count} selected games to ${res.backup_name}`);
           loadData();
         } else {
-          alert("Backup failed: " + res.error);
+          showToast(`✗ Backup failed: ${res.error}`);
         }
       });
 
@@ -281,11 +282,106 @@
           showToast(`✓ Backed up whole library (${res.count} games) to ${res.backup_name}`);
           loadData();
         } else {
-          alert("Backup failed: " + res.error);
+          showToast(`✗ Backup failed: ${res.error}`);
         }
       });
 
       populate("");
+    }
+
+    // ── Selective Restore In-DOM Modal ─────────────────────────────────────────
+    function openSelectiveModal(backup) {
+      const existingSel = document.getElementById("slm-selective-modal");
+      if (existingSel) existingSel.remove();
+
+      const selModal = document.createElement("div");
+      selModal.id = "slm-selective-modal";
+      selModal.style.cssText = `
+        position: absolute; top: 0; left: 0; right: 0; bottom: 0;
+        background: rgba(15, 18, 23, 0.95); z-index: 100;
+        display: flex; flex-direction: column; padding: 24px;
+      `;
+
+      const games = backup.games || [];
+      selModal.innerHTML = `
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom: 16px;">
+          <div>
+            <h3 style="margin:0;color:#fff;font-size:16px;">Select Games to Restore</h3>
+            <small style="color:#8f98a0;">From: ${backup.filename}</small>
+          </div>
+          <button id="slm-sel-close" class="slm-header-close">✕</button>
+        </div>
+
+        <div style="display:flex; gap:10px; margin-bottom:12px;">
+          <button id="slm-sel-toggle-all" class="slm-btn-secondary">Select All / None</button>
+          <button id="slm-sel-confirm" class="slm-btn-primary">📥 Restore Selected (<span id="slm-sel-badge">0</span>)</button>
+        </div>
+
+        <div style="flex:1; overflow-y:auto; border:1px solid #282f3c; border-radius:6px; padding:8px; background:#12151b;">
+          <table class="slm-table">
+            <thead>
+              <tr>
+                <th width="30">#</th>
+                <th>Game Title</th>
+                <th>AppID</th>
+                <th>Type</th>
+              </tr>
+            </thead>
+            <tbody id="slm-sel-body"></tbody>
+          </table>
+        </div>
+      `;
+
+      win.appendChild(selModal);
+
+      const selBody = selModal.querySelector("#slm-sel-body");
+      const selBadge = selModal.querySelector("#slm-sel-badge");
+      const btnConfirm = selModal.querySelector("#slm-sel-confirm");
+      const btnToggle = selModal.querySelector("#slm-sel-toggle-all");
+
+      function updateSelBadge() {
+        const count = selBody.querySelectorAll(".slm-sel-chk:checked").length;
+        selBadge.textContent = count;
+      }
+
+      games.forEach(g => {
+        const tr = document.createElement("tr");
+        tr.innerHTML = `
+          <td><input type="checkbox" class="slm-sel-chk" value="${g.appid}"></td>
+          <td style="font-weight:600;color:#fff;">${g.name}</td>
+          <td style="color:#8f98a0;">${g.appid}</td>
+          <td><span class="slm-badge official">${g.source || 'Steam'}</span></td>
+        `;
+        tr.querySelector(".slm-sel-chk").addEventListener("change", updateSelBadge);
+        selBody.appendChild(tr);
+      });
+
+      btnToggle.addEventListener("click", () => {
+        const chks = selBody.querySelectorAll(".slm-sel-chk");
+        const anyUnchecked = Array.from(chks).some(c => !c.checked);
+        chks.forEach(c => c.checked = anyUnchecked);
+        updateSelBadge();
+      });
+
+      btnConfirm.addEventListener("click", async () => {
+        const chosen = Array.from(selBody.querySelectorAll(".slm-sel-chk:checked")).map(c => parseInt(c.value));
+        if (chosen.length === 0) {
+          showToast("Please select at least one game to restore.");
+          return;
+        }
+        btnConfirm.disabled = true;
+        btnConfirm.textContent = "Restoring...";
+        const res = await apiCall("restore", { backup_filename: backup.filename, appids: chosen });
+        selModal.remove();
+        if (res.success) {
+          showToast(`✓ Restored ${res.restored_count} games! Restart Steam to refresh.`);
+          loadData();
+        } else {
+          showToast(`✗ Restore failed: ${res.error}`);
+        }
+      });
+
+      selModal.querySelector("#slm-sel-close").addEventListener("click", () => selModal.remove());
     }
 
     // ── Restore Tab ────────────────────────────────────────────────────────────
@@ -303,7 +399,7 @@
               <th>Games</th>
               <th>Size</th>
               <th>Created</th>
-              <th width="240">Actions</th>
+              <th width="260">Actions</th>
             </tr>
           </thead>
           <tbody id="slm-backups-body"></tbody>
@@ -335,41 +431,69 @@
           </td>
         `;
 
-        tr.querySelector("[data-action='all']").addEventListener("click", async () => {
-          if (!confirm(`Restore all ${b.count} games from ${b.filename}?`)) return;
+        const btnAll = tr.querySelector("[data-action='all']");
+        const btnSel = tr.querySelector("[data-action='sel']");
+        const btnDel = tr.querySelector("[data-action='del']");
+
+        // 2-step inline confirm for Restore All
+        let restoreArmed = false;
+        let restoreTimer = null;
+        btnAll.addEventListener("click", async () => {
+          if (!restoreArmed) {
+            restoreArmed = true;
+            btnAll.textContent = "⚠️ Confirm Restore?";
+            btnAll.style.background = "#2874a6";
+            restoreTimer = setTimeout(() => {
+              restoreArmed = false;
+              btnAll.textContent = "Restore All";
+              btnAll.style.background = "#1a9fff";
+            }, 4000);
+            return;
+          }
+          clearTimeout(restoreTimer);
+          btnAll.disabled = true;
+          btnAll.textContent = "Restoring...";
           const res = await apiCall("restore", { backup_filename: b.filename, appids: "all" });
           if (res.success) {
             showToast(`✓ Restored ${res.restored_count} games! Restart Steam to refresh.`);
             loadData();
           } else {
-            alert("Restore failed: " + res.error);
+            showToast(`✗ Restore failed: ${res.error}`);
           }
         });
 
-        tr.querySelector("[data-action='sel']").addEventListener("click", async () => {
-          const gamesList = b.games || [];
-          const msg = "Enter AppIDs to restore separated by comma (leave blank to restore all):\\n\\n" +
-            gamesList.map(g => `${g.appid}: ${g.name} (${g.source || 'Steam'})`).join("\\n");
-          const input = prompt(msg);
-          if (input === null) return;
-          const aids = input.trim() === "" ? "all" : input.split(",").map(s => parseInt(s.trim())).filter(n => !isNaN(n));
-          const res = await apiCall("restore", { backup_filename: b.filename, appids: aids });
-          if (res.success) {
-            showToast(`✓ Restored ${res.restored_count} games! Restart Steam to refresh.`);
-            loadData();
-          } else {
-            alert("Restore failed: " + res.error);
-          }
+        // In-DOM Selective modal
+        btnSel.addEventListener("click", () => {
+          openSelectiveModal(b);
         });
 
-        tr.querySelector("[data-action='del']").addEventListener("click", async () => {
-          if (!confirm(`Permanently delete backup archive:\n\n${b.filename}?`)) return;
+        // 2-step inline confirm for Delete (Zero browser confirm() needed!)
+        let deleteArmed = false;
+        let deleteTimer = null;
+        btnDel.addEventListener("click", async () => {
+          if (!deleteArmed) {
+            deleteArmed = true;
+            btnDel.textContent = "⚠️ Confirm Delete?";
+            btnDel.style.background = "#ec5c5c";
+            btnDel.style.color = "#ffffff";
+            deleteTimer = setTimeout(() => {
+              deleteArmed = false;
+              btnDel.textContent = "🗑 Delete";
+              btnDel.style.background = "rgba(236, 92, 92, 0.12)";
+              btnDel.style.color = "#f28b82";
+            }, 4000);
+            return;
+          }
+
+          clearTimeout(deleteTimer);
+          btnDel.disabled = true;
+          btnDel.textContent = "Deleting...";
           const res = await apiCall("delete_backup", { filename: b.filename });
           if (res.success) {
-            showToast(`✓ Deleted backup: ${b.filename}`);
+            showToast(`✓ Permanently deleted ${b.filename}`);
             loadData();
           } else {
-            alert("Delete failed: " + (res.error || "Unknown error"));
+            showToast(`✗ Delete failed: ${res.error || 'Unknown error'}`);
           }
         });
 
