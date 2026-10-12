@@ -23,6 +23,29 @@ DEFAULT_STPLUG_DIR = os.path.join(DEFAULT_STEAM_ROOT, "config/stplug-in")
 DEFAULT_SLS_DIR = os.path.expanduser("~/.config/SLSsteam")
 DEFAULT_BACKUP_DIR = os.path.expanduser("~/SteamLibrary-Backups")
 NAMES_CACHE_FILE = os.path.expanduser("~/.config/steam-library-manager/names_cache.json")
+def _resolve_repo_dir():
+    candidates = [
+        os.path.abspath(os.path.join(os.path.dirname(__file__), "..")),
+        os.path.expanduser("~/.local/share/Steam/plugins/steam-library-manager"),
+        os.path.expanduser("~/WorkSpace/Code/steam-library-manager")
+    ]
+    for c in candidates:
+        if os.path.exists(os.path.join(c, "frontend/styles.css")):
+            return c
+    return candidates[0]
+
+REPO_DIR = _resolve_repo_dir()
+
+def is_runtime_tool(name="", installdir=""):
+    s = (str(name) + " " + str(installdir)).lower()
+    return any(k in s for k in [
+        "proton",
+        "steam linux runtime",
+        "steamworks shared",
+        "steam controller configs",
+        "steamworks common redistributables",
+        "steamvr"
+    ])
 
 def get_steam_libraries():
     roots = [DEFAULT_STEAM_ROOT]
@@ -146,7 +169,7 @@ def resolve_all_dynamic_names():
                 mname = re.search(r'"name"\s+"([^"]+)"', txt)
                 if aid and mname:
                     a = int(aid.group(1))
-                    if a not in [228980, 1493710, 4183110]:
+                    if not is_runtime_tool(mname.group(1)):
                         if a not in names:
                             names[a] = mname.group(1)
             except Exception:
@@ -173,7 +196,7 @@ def get_all_library_games():
 
                 if aid and name:
                     a = int(aid.group(1))
-                    if a in [228980, 1493710, 4183110]:
+                    if is_runtime_tool(name.group(1), inst_dir.group(1) if inst_dir else ""):
                         continue
                     display_name = names.get(a, name.group(1))
                     names[a] = display_name
@@ -231,7 +254,7 @@ def get_all_library_games():
                 games_map[a]["source"] = "Official / LuaTools"
 
     for a, gname in names.items():
-        if a not in games_map and a not in [228980, 1493710, 4183110]:
+        if a not in games_map and not is_runtime_tool(gname):
             games_map[a] = {
                 "appid": a,
                 "name": gname,
