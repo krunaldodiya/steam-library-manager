@@ -473,7 +473,7 @@
         btnDel.addEventListener("click", async () => {
           if (!deleteArmed) {
             deleteArmed = true;
-            btnDel.textContent = "⚠️ Confirm Delete?";
+            btnDel.textContent = "Sure?";
             btnDel.style.background = "#ec5c5c";
             btnDel.style.color = "#ffffff";
             deleteTimer = setTimeout(() => {
