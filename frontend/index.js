@@ -150,8 +150,6 @@
 
         <div class="slm-toolbar">
           <input type="text" id="slm-search" class="slm-input" placeholder="🔍 Search games, AppID, or source...">
-          <button class="slm-btn-secondary" id="slm-toggle-all">Select All / None</button>
-          
           <button class="slm-btn-secondary" id="slm-btn-sync" disabled style="opacity:0.4;cursor:not-allowed;">
             <span>🔄</span><span>Sync (<span id="slm-sync-count">0</span>)</span>
           </button>
@@ -182,7 +180,6 @@
       const btnSyncCount = content.querySelector("#slm-sync-count");
       const btnSync = content.querySelector("#slm-btn-sync");
       const btnBackup = content.querySelector("#slm-btn-backup");
-      const btnToggleAll = content.querySelector("#slm-toggle-all");
       const thChk = content.querySelector("#slm-th-chk");
 
       content.querySelectorAll(".slm-chip").forEach(chip => {
@@ -196,9 +193,15 @@
 
       // Update button state (enabled when >= 1 selected, disabled/readonly when 0)
       function updateButtonStates() {
-        const count = tbody.querySelectorAll(".slm-gchk:checked").length;
+        const chks = tbody.querySelectorAll(".slm-gchk");
+        const checkedChks = tbody.querySelectorAll(".slm-gchk:checked");
+        const count = checkedChks.length;
         btnSelCount.textContent = count;
         btnSyncCount.textContent = count;
+        if (thChk && chks.length > 0) {
+          thChk.checked = checkedChks.length === chks.length;
+          thChk.indeterminate = count > 0 && count < chks.length;
+        }
         if (count > 0) {
           btnSync.disabled = false;
           btnSync.style.opacity = "1";
@@ -278,13 +281,6 @@
 
       search.addEventListener("input", () => populate(search.value));
 
-      btnToggleAll.addEventListener("click", () => {
-        const chks = tbody.querySelectorAll(".slm-gchk");
-        const anyUnchecked = Array.from(chks).some(c => !c.checked);
-        chks.forEach(c => c.checked = anyUnchecked);
-        if (thChk) thChk.checked = anyUnchecked;
-        updateButtonStates();
-      });
 
       if (thChk) {
         thChk.addEventListener("change", () => {
@@ -471,10 +467,7 @@
         </div>
 
         <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
-          <div style="display:flex;gap:8px;align-items:center;">
-            <button id="slm-pop-toggle" class="slm-btn-secondary" style="padding:6px 12px;font-size:12px;">Select All / None</button>
-            <span style="font-size:12px;color:#8f98a0;">All games are checked by default. Uncheck any games you wish to skip.</span>
-          </div>
+          <span style="font-size:12px;color:#8f98a0;">All games are checked by default. Uncheck any games you wish to skip.</span>
           <button id="slm-pop-confirm" class="slm-btn-primary" style="background:#2874a6;">
             <span>📥</span><span>Restore Selected (<span id="slm-pop-count">0</span> Games)</span>
           </button>
@@ -504,14 +497,19 @@
       const popBody = pop.querySelector("#slm-pop-body");
       const popCount = pop.querySelector("#slm-pop-count");
       const popConfirm = pop.querySelector("#slm-pop-confirm");
-      const popToggle = pop.querySelector("#slm-pop-toggle");
       const popThChk = pop.querySelector("#slm-pop-th-chk");
 
       popClose.addEventListener("click", () => pop.remove());
 
       function updateCount() {
-        const n = popBody.querySelectorAll(".slm-pop-chk:checked").length;
+        const chks = popBody.querySelectorAll(".slm-pop-chk");
+        const checkedChks = popBody.querySelectorAll(".slm-pop-chk:checked");
+        const n = checkedChks.length;
         popCount.textContent = n;
+        if (popThChk && chks.length > 0) {
+          popThChk.checked = checkedChks.length === chks.length;
+          popThChk.indeterminate = n > 0 && n < chks.length;
+        }
         if (n > 0) {
           popConfirm.disabled = false;
           popConfirm.style.opacity = "1";
@@ -555,13 +553,6 @@
       if (popThChk) popThChk.checked = true;
       updateCount();
 
-      popToggle.addEventListener("click", () => {
-        const chks = popBody.querySelectorAll(".slm-pop-chk");
-        const anyUnchecked = Array.from(chks).some(c => !c.checked);
-        chks.forEach(c => c.checked = anyUnchecked);
-        if (popThChk) popThChk.checked = anyUnchecked;
-        updateCount();
-      });
 
       if (popThChk) {
         popThChk.addEventListener("change", () => {
