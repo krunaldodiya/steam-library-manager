@@ -1,0 +1,817 @@
+#!/usr/bin/env python3
+"""
+Steam Library Manager (SLSsteam / LuaTools / Lumen Companion)
+Export and Restore games metadata (all, multiple, or single).
+"""
+
+import os
+import sys
+import glob
+import re
+import json
+import time
+import shutil
+import zipfile
+import argparse
+from datetime import datetime
+from pathlib import Path
+
+# Paths
+DEFAULT_STEAM_ROOT = os.path.expanduser("~/.local/share/Steam")
+DEFAULT_STPLUG_DIR = os.path.join(DEFAULT_STEAM_ROOT, "config/stplug-in")
+DEFAULT_SLS_DIR = os.path.expanduser("~/.config/SLSsteam")
+DEFAULT_BACKUP_DIR = os.path.expanduser("~/SteamLibrary-Backups")
+
+KNOWN_NAMES = {
+    730: "Counter-Strike 2", 204100: "Max Payne 3", 292030: "The Witcher 3: Wild Hunt",
+    391220: "Rise of the Tomb Raider", 447040: "Watch_Dogs 2", 552520: "Far Cry 5",
+    582160: "Assassin's Creed Origins", 814380: "Sekiro™: Shadows Die Twice",
+    870780: "Control Ultimate Edition", 934700: "Cricket 22", 1028630: "Cricket 19",
+    1030840: "Mafia: Definitive Edition", 1116960: "UNDEFEATED", 1174180: "Red Dead Redemption 2",
+    1196590: "Resident Evil Village", 1238860: "Battlefield 4™", 1259420: "Days Gone",
+    1338770: "Sniper Ghost Warrior Contracts 2", 1364780: "Street Fighter™ 6",
+    1504980: "It Takes Two Friend's Pass", 1593500: "God of War", 1627720: "Lies of P",
+    1659040: "HITMAN World of Assassination", 1659420: "UNCHARTED™: Legacy of Thieves Collection",
+    1815780: "Asphalt Legends", 1817190: "Marvel's Spider-Man: Miles Morales",
+    1888930: "The Last of Us™ Part I", 2215430: "Ghost of Tsushima DIRECTOR'S CUT",
+    2358720: "Black Myth: Wukong", 3240220: "Grand Theft Auto V Enhanced",
+    3468650: "Cricket 26 - The Official Game of the Ashes"
+}
+
+def get_steam_libraries():
+    roots = [DEFAULT_STEAM_ROOT]
+    vdf = os.path.join(DEFAULT_STEAM_ROOT, "steamapps/libraryfolders.vdf")
+    if os.path.exists(vdf):
+        try:
+            with open(vdf, "r", encoding="utf-8", errors="ignore") as f:
+                content = f.read()
+            paths = re.findall(r'"path"\s+"([^"]+)"', content)
+            for p in paths:
+                if p not in roots and os.path.exists(p):
+                    roots.append(p)
+        except Exception:
+            pass
+    return roots
+
+def resolve_game_names():
+    names = dict(KNOWN_NAMES)
+    for lib in get_steam_libraries():
+        manifests = glob.glob(os.path.join(lib, "steamapps/appmanifest_*.acf"))
+        for m in manifests:
+            try:
+                with open(m, "r", encoding="utf-8", errors="ignore") as f:
+                    data = f.read()
+                aid = re.search(r'"appid"\s+"(\d+)"', data)
+                name = re.search(r'"name"\s+"([^"]+)"', data)
+                if aid and name:
+                    names[int(aid.group(1))] = name.group(1)
+            except Exception:
+                pass
+    return names
+
+def get_installed_appids():
+    installed = set()
+    for lib in get_steam_libraries():
+        manifests = glob.glob(os.path.join(lib, "steamapps/appmanifest_*.acf"))
+        for m in manifests:
+            try:
+                with open(m, "r", encoding="utf-8", errors="ignore") as f:
+                    data = f.read()
+                aid = re.search(r'"appid"\s+"(\d+)"', data)
+                if aid:
+                    installed.add(int(aid.group(1)))
+            except Exception:
+                pass
+    return installed
+
+def get_managed_games():
+    names = resolve_game_names()
+    installed = get_installed_appids()
+    games = []
+    if not os.path.exists(DEFAULT_STPLUG_DIR):
+        return games
+
+    for fname in sorted(os.listdir(DEFAULT_STPLUG_DIR)):
+        if not fname.endswith(".lua"):
+            continue
+        try:
+            aid = int(fname[:-4])
+        except ValueError:
+            continue
+        fpath = os.path.join(DEFAULT_STPLUG_DIR, fname)
+        size = os.path.getsize(fpath)
+        mtime = os.path.getmtime(fpath)
+        game_name = names.get(aid, f"AppID {aid}")
+        is_inst = aid in installed
+
+        # Extract depots from lua
+        depots = []
+        try:
+            with open(fpath, "r", encoding="utf-8", errors="ignore") as lf:
+                ltext = lf.read()
+            depots = [int(d) for d in re.findall(r'addappid\((\d+)', ltext)]
+        except Exception:
+            pass
+
+        games.append({
+            "appid": aid,
+            "name": game_name,
+            "installed": is_inst,
+            "lua_file": fname,
+            "lua_size": size,
+            "mtime": mtime,
+            "depots": depots
+        })
+    return games
+
+def export_games(appids=None, backup_name=None, backup_dir=DEFAULT_BACKUP_DIR):
+    all_games = get_managed_games()
+    if not all_games:
+        return {"success": False, "error": "No managed games found in stplug-in"}
+
+    if appids is None or appids == "all":
+        selected_games = all_games
+    else:
+        req_set = set(int(a) for a in appids)
+        selected_games = [g for g in all_games if g["appid"] in req_set]
+
+    if not selected_games:
+        return {"success": False, "error": "No matching games selected to export"}
+
+    os.makedirs(backup_dir, exist_ok=True)
+    ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    if not backup_name:
+        if len(selected_games) == 1:
+            clean_name = re.sub(r'[^a-zA-Z0-9_\-]', '_', selected_games[0]["name"])
+            backup_name = f"game_{selected_games[0]['appid']}_{clean_name}_{ts}.zip"
+        elif len(selected_games) == len(all_games):
+            backup_name = f"steam_library_full_{ts}.zip"
+        else:
+            backup_name = f"steam_library_{len(selected_games)}_games_{ts}.zip"
+
+    if not backup_name.endswith(".zip"):
+        backup_name += ".zip"
+
+    zip_path = os.path.join(backup_dir, backup_name)
+    metadata = {
+        "version": "1.0",
+        "created_at": ts,
+        "total_games": len(selected_games),
+        "games": selected_games
+    }
+
+    manifests_dir = os.path.join(DEFAULT_SLS_DIR, "manifests")
+    all_depots = set()
+    for g in selected_games:
+        all_depots.update(g["depots"])
+
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("metadata.json", json.dumps(metadata, indent=2))
+
+        # Add .lua files
+        for g in selected_games:
+            src = os.path.join(DEFAULT_STPLUG_DIR, g["lua_file"])
+            if os.path.exists(src):
+                zf.write(src, f"stplug-in/{g['lua_file']}")
+
+        # Add corresponding manifests if present
+        if os.path.exists(manifests_dir):
+            for mfile in os.listdir(manifests_dir):
+                m_match = re.match(r"^(\d+)_\d+\.manifest$", mfile)
+                if m_match and int(m_match.group(1)) in all_depots:
+                    msrc = os.path.join(manifests_dir, mfile)
+                    zf.write(msrc, f"manifests/{mfile}")
+
+        # Add library-added-times.txt
+        lat = os.path.join(DEFAULT_SLS_DIR, "library-added-times.txt")
+        if os.path.exists(lat):
+            zf.write(lat, "sls/library-added-times.txt")
+
+    # Update auto-mirror folder
+    mirror_dir = os.path.join(backup_dir, "latest")
+    os.makedirs(os.path.join(mirror_dir, "stplug-in"), exist_ok=True)
+    for g in selected_games:
+        src = os.path.join(DEFAULT_STPLUG_DIR, g["lua_file"])
+        if os.path.exists(src):
+            shutil.copy2(src, os.path.join(mirror_dir, "stplug-in", g["lua_file"]))
+    with open(os.path.join(mirror_dir, "metadata.json"), "w") as mf:
+        json.dump(metadata, mf, indent=2)
+
+    return {
+        "success": True,
+        "path": zip_path,
+        "backup_name": backup_name,
+        "count": len(selected_games),
+        "games": selected_games
+    }
+
+def list_backups(backup_dir=DEFAULT_BACKUP_DIR):
+    if not os.path.exists(backup_dir):
+        return []
+    backups = []
+    for f in sorted(os.listdir(backup_dir), reverse=True):
+        if not f.endswith(".zip"):
+            continue
+        p = os.path.join(backup_dir, f)
+        size = os.path.getsize(p)
+        mtime = os.path.getmtime(p)
+        games_list = []
+        try:
+            with zipfile.ZipFile(p, "r") as zf:
+                if "metadata.json" in zf.namelist():
+                    meta = json.loads(zf.read("metadata.json").decode("utf-8"))
+                    games_list = meta.get("games", [])
+                else:
+                    for n in zf.namelist():
+                        if n.startswith("stplug-in/") and n.endswith(".lua"):
+                            aid = int(n[10:-4])
+                            games_list.append({"appid": aid, "name": KNOWN_NAMES.get(aid, f"AppID {aid}")})
+        except Exception:
+            pass
+
+        backups.append({
+            "filename": f,
+            "path": p,
+            "size": size,
+            "mtime": mtime,
+            "count": len(games_list),
+            "games": games_list
+        })
+    return backups
+
+def restore_games(backup_path=None, appids=None, backup_dir=DEFAULT_BACKUP_DIR):
+    if not backup_path:
+        all_b = list_backups(backup_dir)
+        if not all_b:
+            return {"success": False, "error": "No backup files found to restore from"}
+        backup_path = all_b[0]["path"]
+
+    if not os.path.exists(backup_path):
+        return {"success": False, "error": f"Backup file not found: {backup_path}"}
+
+    os.makedirs(DEFAULT_STPLUG_DIR, exist_ok=True)
+    manifests_dir = os.path.join(DEFAULT_SLS_DIR, "manifests")
+    os.makedirs(manifests_dir, exist_ok=True)
+
+    restored = []
+    with zipfile.ZipFile(backup_path, "r") as zf:
+        namelist = zf.namelist()
+        meta = {}
+        if "metadata.json" in namelist:
+            try:
+                meta = json.loads(zf.read("metadata.json").decode("utf-8"))
+            except Exception:
+                pass
+
+        available_games = meta.get("games", [])
+        avail_map = {g["appid"]: g for g in available_games}
+
+        target_appids = None
+        if appids is not None and appids != "all":
+            target_appids = set(int(a) for a in appids)
+
+        for member in namelist:
+            if member.startswith("stplug-in/") and member.endswith(".lua"):
+                fname = os.path.basename(member)
+                try:
+                    aid = int(fname[:-4])
+                except ValueError:
+                    continue
+                if target_appids is not None and aid not in target_appids:
+                    continue
+
+                dest = os.path.join(DEFAULT_STPLUG_DIR, fname)
+                with open(dest, "wb") as f:
+                    f.write(zf.read(member))
+
+                g_info = avail_map.get(aid, {"appid": aid, "name": KNOWN_NAMES.get(aid, f"AppID {aid}")})
+                restored.append(g_info)
+
+            elif member.startswith("manifests/") and member.endswith(".manifest"):
+                fname = os.path.basename(member)
+                dest = os.path.join(manifests_dir, fname)
+                with open(dest, "wb") as f:
+                    f.write(zf.read(member))
+
+            elif member == "sls/library-added-times.txt":
+                dest = os.path.join(DEFAULT_SLS_DIR, "library-added-times.txt")
+                if not os.path.exists(dest):
+                    with open(dest, "wb") as f:
+                        f.write(zf.read(member))
+
+    return {
+        "success": True,
+        "restored_count": len(restored),
+        "games": restored,
+        "backup_path": backup_path
+    }
+
+def import_single_file(file_path):
+    if not os.path.exists(file_path):
+        return {"success": False, "error": f"File not found: {file_path}"}
+    if not file_path.endswith(".lua"):
+        return {"success": False, "error": "Only .lua manifest scripts can be imported directly"}
+
+    fname = os.path.basename(file_path)
+    os.makedirs(DEFAULT_STPLUG_DIR, exist_ok=True)
+    dest = os.path.join(DEFAULT_STPLUG_DIR, fname)
+    shutil.copy2(file_path, dest)
+    try:
+        aid = int(fname[:-4])
+        name = KNOWN_NAMES.get(aid, f"AppID {aid}")
+    except Exception:
+        aid = 0
+        name = fname
+    return {"success": True, "appid": aid, "name": name, "dest": dest}
+
+# Minimal Local Web GUI
+def start_gui_server(port=8342):
+    import http.server
+    import urllib.parse
+    import webbrowser
+
+    class RequestHandler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, format, *args):
+            pass # Silent
+
+        def do_GET(self):
+            parsed = urllib.parse.urlparse(self.path)
+            if parsed.path == "/api/status":
+                games = get_managed_games()
+                backups = list_backups()
+                data = {
+                    "games": games,
+                    "backups": backups,
+                    "total_games": len(games),
+                    "total_backups": len(backups)
+                }
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps(data).encode("utf-8"))
+                return
+
+            # Main HTML UI
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            html = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Steam Library Manager</title>
+<style>
+  :root {
+    --bg: #171a21;
+    --card: #1e232d;
+    --card-border: #2e3543;
+    --accent: #1a9fff;
+    --accent-hover: #33a9ff;
+    --text: #c7d5e0;
+    --text-bright: #ffffff;
+    --text-muted: #8f98a0;
+    --success: #5c7e10;
+    --success-bright: #a4d007;
+  }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    margin: 0; padding: 24px;
+  }
+  .container { max-width: 1000px; margin: 0 auto; }
+  h1 { color: var(--text-bright); display: flex; align-items: center; gap: 12px; margin-bottom: 8px; }
+  .subtitle { color: var(--text-muted); margin-bottom: 24px; }
+  .tabs { display: flex; gap: 8px; margin-bottom: 20px; }
+  .tab-btn {
+    background: var(--card); border: 1px solid var(--card-border); color: var(--text);
+    padding: 10px 20px; border-radius: 6px; cursor: pointer; font-weight: 600;
+  }
+  .tab-btn.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+  .panel { display: none; background: var(--card); border: 1px solid var(--card-border); border-radius: 8px; padding: 20px; }
+  .panel.active { display: block; }
+  .action-bar { display: flex; gap: 12px; align-items: center; margin-bottom: 16px; flex-wrap: wrap; }
+  input[type="text"] {
+    background: #12151b; border: 1px solid var(--card-border); color: #fff;
+    padding: 8px 14px; border-radius: 4px; flex: 1; min-width: 200px;
+  }
+  button.primary {
+    background: var(--accent); border: none; color: #fff; padding: 9px 18px; border-radius: 4px;
+    cursor: pointer; font-weight: 600; transition: background 0.15s;
+  }
+  button.primary:hover { background: var(--accent-hover); }
+  button.secondary {
+    background: #2a313d; border: 1px solid var(--card-border); color: #fff;
+    padding: 9px 18px; border-radius: 4px; cursor: pointer; font-weight: 500;
+  }
+  button.secondary:hover { background: #384252; }
+  .game-table { width: 100%; border-collapse: collapse; margin-top: 12px; }
+  .game-table th, .game-table td { padding: 10px 12px; text-align: left; border-bottom: 1px solid #282f3c; }
+  .game-table th { color: var(--text-muted); font-size: 13px; text-transform: uppercase; }
+  .game-table tr:hover { background: rgba(255,255,255,0.02); }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 12px; font-weight: 600; }
+  .badge.installed { background: rgba(92,126,16,0.2); color: var(--success-bright); }
+  .badge.library { background: rgba(26,159,255,0.15); color: var(--accent); }
+  .toast {
+    position: fixed; bottom: 24px; right: 24px; background: #222731; border: 1px solid var(--accent);
+    color: #fff; padding: 14px 24px; border-radius: 6px; box-shadow: 0 4px 16px rgba(0,0,0,0.5);
+    display: none; z-index: 1000;
+  }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>🎮 Steam Library Manager</h1>
+  <div class="subtitle">Complete Backup & Restore for SLSsteam / LuaTools games (Single, Multi-Select, or All)</div>
+
+  <div class="tabs">
+    <button class="tab-btn active" onclick="switchTab('export')">📦 Export & Backup</button>
+    <button class="tab-btn" onclick="switchTab('restore')">📥 Restore & Import</button>
+  </div>
+
+  <div id="tab-export" class="panel active">
+    <div class="action-bar">
+      <input type="text" id="search-box" placeholder="🔍 Search games..." oninput="filterGames()">
+      <button class="secondary" onclick="toggleSelectAll()">Select All / None</button>
+      <button class="primary" onclick="exportSelected()">💾 Export Selected (<span id="sel-count">0</span>)</button>
+      <button class="primary" style="background:#2874a6" onclick="exportAll()">📦 Backup Whole Library</button>
+    </div>
+
+    <table class="game-table">
+      <thead>
+        <tr>
+          <th width="30"><input type="checkbox" id="th-checkbox" onchange="toggleSelectAll()"></th>
+          <th>Game</th>
+          <th>AppID</th>
+          <th>Status</th>
+          <th width="100">Action</th>
+        </tr>
+      </thead>
+      <tbody id="games-list">
+        <tr><td colspan="5" style="text-align:center;padding:24px;">Loading library...</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div id="tab-restore" class="panel">
+    <div class="action-bar">
+      <h3 style="margin:0;color:#fff;">Available Backups</h3>
+      <button class="secondary" onclick="loadData()">🔄 Refresh</button>
+    </div>
+    <table class="game-table">
+      <thead>
+        <tr>
+          <th>Backup Archive</th>
+          <th>Games</th>
+          <th>Size</th>
+          <th>Created</th>
+          <th width="200">Actions</th>
+        </tr>
+      </thead>
+      <tbody id="backups-list">
+        <tr><td colspan="5" style="text-align:center;padding:24px;">No backups found yet.</td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+<div id="toast" class="toast"></div>
+
+<script>
+let state = { games: [], backups: [] };
+
+function showToast(msg) {
+  const t = document.getElementById("toast");
+  t.innerText = msg;
+  t.style.display = "block";
+  setTimeout(() => { t.style.display = "none"; }, 4000);
+}
+
+function switchTab(t) {
+  document.querySelectorAll(".tab-btn").forEach(b => b.classList.remove("active"));
+  document.querySelectorAll(".panel").forEach(p => p.classList.remove("active"));
+  if (t === "export") {
+    document.querySelectorAll(".tab-btn")[0].classList.add("active");
+    document.getElementById("tab-export").classList.add("active");
+  } else {
+    document.querySelectorAll(".tab-btn")[1].classList.add("active");
+    document.getElementById("tab-restore").classList.add("active");
+  }
+}
+
+async function loadData() {
+  const res = await fetch("/api/status");
+  state = await res.json();
+  renderGames();
+  renderBackups();
+}
+
+function renderGames() {
+  const q = document.getElementById("search-box").value.toLowerCase();
+  const tb = document.getElementById("games-list");
+  tb.innerHTML = "";
+  const filtered = state.games.filter(g => g.name.toLowerCase().includes(q) || g.appid.toString().includes(q));
+
+  if (filtered.length === 0) {
+    tb.innerHTML = "<tr><td colspan='5' style='text-align:center;padding:24px;'>No matching games found.</td></tr>";
+    return;
+  }
+
+  filtered.forEach(g => {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td><input type="checkbox" class="game-chk" value="${g.appid}" onchange="updateSelCount()"></td>
+      <td style="font-weight:600;color:#fff;">${g.name}</td>
+      <td style="color:#8f98a0;">${g.appid}</td>
+      <td><span class="badge ${g.installed ? 'installed' : 'library'}">${g.installed ? 'Installed' : 'In Library'}</span></td>
+      <td><button class="secondary" style="padding:4px 10px;font-size:12px;" onclick="exportSingle(${g.appid})">Export</button></td>
+    `;
+    tb.appendChild(tr);
+  });
+  updateSelCount();
+}
+
+function filterGames() { renderGames(); }
+
+function updateSelCount() {
+  const count = document.querySelectorAll(".game-chk:checked").length;
+  document.getElementById("sel-count").innerText = count;
+}
+
+function toggleSelectAll() {
+  const chks = document.querySelectorAll(".game-chk");
+  const anyUnchecked = Array.from(chks).some(c => !c.checked);
+  chks.forEach(c => c.checked = anyUnchecked);
+  updateSelCount();
+}
+
+function renderBackups() {
+  const tb = document.getElementById("backups-list");
+  tb.innerHTML = "";
+  if (!state.backups || state.backups.length === 0) {
+    tb.innerHTML = "<tr><td colspan='5' style='text-align:center;padding:24px;'>No backups found in ~/SteamLibrary-Backups.</td></tr>";
+    return;
+  }
+
+  state.backups.forEach(b => {
+    const tr = document.createElement("tr");
+    const dt = new Date(b.mtime * 1000).toLocaleString();
+    const sz = (b.size / 1024).toFixed(1) + " KB";
+    tr.innerHTML = `
+      <td style="font-weight:600;color:#fff;">${b.filename}</td>
+      <td>${b.count} games</td>
+      <td>${sz}</td>
+      <td style="color:#8f98a0;">${dt}</td>
+      <td>
+        <button class="primary" style="padding:4px 10px;font-size:12px;" onclick="restoreBackup('${b.filename}', 'all')">Restore All</button>
+        <button class="secondary" style="padding:4px 10px;font-size:12px;margin-left:6px;" onclick="restoreSelectivePrompt('${b.filename}')">Selective</button>
+      </td>
+    `;
+    tb.appendChild(tr);
+  });
+}
+
+async function exportSingle(aid) {
+  const res = await fetch("/api/export", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({ appids: [aid] })
+  });
+  const data = await res.json();
+  if (data.success) {
+    showToast(`✓ Exported ${data.count} game to ${data.backup_name}`);
+    loadData();
+  } else {
+    alert("Export failed: " + data.error);
+  }
+}
+
+async function exportSelected() {
+  const sel = Array.from(document.querySelectorAll(".game-chk:checked")).map(c => parseInt(c.value));
+  if (sel.length === 0) {
+    alert("Please select at least one game.");
+    return;
+  }
+  const res = await fetch("/api/export", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({ appids: sel })
+  });
+  const data = await res.json();
+  if (data.success) {
+    showToast(`✓ Exported ${data.count} selected games to ${data.backup_name}`);
+    loadData();
+  } else {
+    alert("Export failed: " + data.error);
+  }
+}
+
+async function exportAll() {
+  const res = await fetch("/api/export", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({ appids: "all" })
+  });
+  const data = await res.json();
+  if (data.success) {
+    showToast(`✓ Backed up whole library (${data.count} games) to ${data.backup_name}`);
+    loadData();
+  } else {
+    alert("Export failed: " + data.error);
+  }
+}
+
+async function restoreBackup(filename, mode, appids=null) {
+  const req = { backup_filename: filename, appids: appids || "all" };
+  const res = await fetch("/api/restore", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify(req)
+  });
+  const data = await res.json();
+  if (data.success) {
+    showToast(`✓ Restored ${data.restored_count} games! Restart Steam to refresh.`);
+    loadData();
+  } else {
+    alert("Restore failed: " + data.error);
+  }
+}
+
+function restoreSelectivePrompt(filename) {
+  const b = state.backups.find(x => x.filename === filename);
+  if (!b || !b.games || b.games.length === 0) {
+    alert("No game metadata found in archive.");
+    return;
+  }
+  const listStr = b.games.map((g, idx) => `${idx + 1}. [AppID: ${g.appid}] ${g.name}`).join("\\n");
+  const choice = prompt("Enter AppIDs to restore separated by commas (or leave blank to restore all):\\n\\n" + listStr);
+  if (choice === null) return;
+  if (choice.trim() === "") {
+    restoreBackup(filename, "all");
+  } else {
+    const aids = choice.split(",").map(s => parseInt(s.trim())).filter(n => !isNaN(n));
+    if (aids.length > 0) {
+      restoreBackup(filename, "selective", aids);
+    }
+  }
+}
+
+window.onload = loadData;
+</script>
+</body>
+</html>"""
+            self.wfile.write(html.encode("utf-8"))
+
+        def do_POST(self):
+            parsed = urllib.parse.urlparse(self.path)
+            length = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(length).decode('utf-8')
+            try:
+                payload = json.loads(body) if body else {}
+            except Exception:
+                payload = {}
+
+            if parsed.path == "/api/export":
+                appids = payload.get("appids")
+                name = payload.get("backup_name")
+                result = export_games(appids=appids, backup_name=name)
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps(result).encode("utf-8"))
+
+            elif parsed.path == "/api/restore":
+                filename = payload.get("backup_filename")
+                bpath = os.path.join(DEFAULT_BACKUP_DIR, filename) if filename else None
+                appids = payload.get("appids")
+                result = restore_games(backup_path=bpath, appids=appids)
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps(result).encode("utf-8"))
+            else:
+                self.send_response(404)
+                self.end_headers()
+
+    server = http.server.HTTPServer(("127.0.0.1", port), RequestHandler)
+    url = f"http://127.0.0.1:{port}"
+    print(f"\n🚀 Steam Library Manager GUI is running at: {url}")
+    print("Press Ctrl+C to close.")
+    try:
+        webbrowser.open(url)
+    except Exception:
+        pass
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nGUI Server stopped.")
+
+def main():
+    parser = argparse.ArgumentParser(description="Steam Library Manager - Backup and Restore SLSsteam/LuaTools games")
+    subparsers = parser.add_subparsers(dest="command")
+
+    # list
+    subparsers.add_parser("list", help="List all managed games")
+
+    # export
+    p_export = subparsers.add_parser("export", help="Export/backup games metadata")
+    p_export.add_argument("--all", action="store_true", help="Export whole library")
+    p_export.add_argument("--games", type=str, help="Comma-separated AppIDs to export (e.g. 1174180,814380)")
+    p_export.add_argument("--game", type=int, help="Single AppID to export")
+    p_export.add_argument("--name", type=str, help="Custom backup file name")
+    p_export.add_argument("--out", type=str, default=DEFAULT_BACKUP_DIR, help="Backup output directory")
+
+    # backups
+    subparsers.add_parser("backups", help="List all available backups")
+
+    # restore
+    p_restore = subparsers.add_parser("restore", help="Restore games from backup")
+    p_restore.add_argument("--backup", type=str, help="Path or filename of backup archive")
+    p_restore.add_argument("--all", action="store_true", help="Restore all games from the backup")
+    p_restore.add_argument("--games", type=str, help="Comma-separated AppIDs to restore")
+    p_restore.add_argument("--game", type=int, help="Single AppID to restore")
+    p_restore.add_argument("--file", type=str, help="Import a single .lua file directly")
+
+    # gui
+    subparsers.add_parser("gui", help="Open local web GUI in browser")
+
+    args = parser.parse_args()
+
+    if not args.command or args.command == "list":
+        games = get_managed_games()
+        print(f"\n🎮 Managed Steam Games ({len(games)} total):")
+        print("─" * 70)
+        for g in games:
+            st = "INSTALLED" if g["installed"] else "IN LIBRARY (DOWNLOADABLE)"
+            print(f"[{g['appid']:7d}] {g['name']:<42} [{st}]")
+        print("─" * 70)
+        print(f"Metadata location: {DEFAULT_STPLUG_DIR}")
+        return
+
+    if args.command == "export":
+        appids = None
+        if args.all:
+            appids = "all"
+        elif args.games:
+            appids = [int(x.strip()) for x in args.games.split(",") if x.strip()]
+        elif args.game:
+            appids = [args.game]
+        else:
+            print("Please specify --all, --games <id1,id2>, or --game <id>.")
+            return
+
+        res = export_games(appids=appids, backup_name=args.name, backup_dir=args.out)
+        if res["success"]:
+            print(f"\n✓ Successfully exported {res['count']} game(s) to:")
+            print(f"  {res['path']}")
+        else:
+            print(f"\n✗ Export failed: {res['error']}")
+
+    elif args.command == "backups":
+        b_list = list_backups()
+        print(f"\n📦 Available Backups in {DEFAULT_BACKUP_DIR}:")
+        print("─" * 70)
+        if not b_list:
+            print("No backups found.")
+        for b in b_list:
+            dt = datetime.fromtimestamp(b["mtime"]).strftime("%Y-%m-%d %H:%M:%S")
+            sz = f"{b['size'] / 1024:.1f} KB"
+            print(f"{b['filename']:<45} {b['count']:2d} games | {sz} | {dt}")
+        print("─" * 70)
+
+    elif args.command == "restore":
+        if args.file:
+            res = import_single_file(args.file)
+            if res["success"]:
+                print(f"\n✓ Imported {res['name']} ({res['appid']}) into stplug-in!")
+                print("  Restart Steam to refresh your library.")
+            else:
+                print(f"\n✗ Import failed: {res['error']}")
+            return
+
+        appids = None
+        if args.all:
+            appids = "all"
+        elif args.games:
+            appids = [int(x.strip()) for x in args.games.split(",") if x.strip()]
+        elif args.game:
+            appids = [args.game]
+
+        bpath = args.backup
+        if bpath and not os.path.isabs(bpath) and not os.path.exists(bpath):
+            bpath = os.path.join(DEFAULT_BACKUP_DIR, bpath)
+
+        res = restore_games(backup_path=bpath, appids=appids)
+        if res["success"]:
+            print(f"\n✓ Successfully restored {res['restored_count']} game(s) from:")
+            print(f"  {res['backup_path']}")
+            for g in res["games"]:
+                print(f"  + [{g['appid']}] {g['name']}")
+            print("\n→ Restart Steam to refresh your library.")
+        else:
+            print(f"\n✗ Restore failed: {res['error']}")
+
+    elif args.command == "gui":
+        start_gui_server()
+
+if __name__ == "__main__":
+    main()
