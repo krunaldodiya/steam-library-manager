@@ -310,7 +310,7 @@ def get_all_library_games():
     return sorted(game_list, key=lambda x: str(x["name"]).lower())
 
 # Sync / Backup Logic (creates/replaces per-game subdirectory in single source of truth)
-def sync_games(appids=None, create_tar=False, tar_name=None):
+def sync_games(appids=None, create_tar=True, tar_name=None):
     all_games = get_all_library_games()
     if not all_games:
         return {"success": False, "error": "No games found in library"}

@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-Steam Library Manager - Backend Engine
-Universal metadata manager (Official Steam & LuaTools/SLSsteam).
-100% Dynamic Game Title Detection from user's Steam client.
-Zero hardcoded games.
+Steam Library Manager - Single Source of Truth Engine
+- Per-game directory backup in ~/SteamLibrary-Backups/games/<appid>_<clean_name>/
+- Per-game sync timestamps
+- Unified single-screen dashboard
+- Interactive restore modal with archive/folder picker & game selection
 """
 
 import os
@@ -13,8 +14,13 @@ import re
 import json
 import time
 import shutil
+import tarfile
 import zipfile
+import argparse
+import threading
 import subprocess
+import http.server
+import urllib.parse
 from datetime import datetime
 from pathlib import Path
 
@@ -22,30 +28,14 @@ DEFAULT_STEAM_ROOT = os.path.expanduser("~/.local/share/Steam")
 DEFAULT_STPLUG_DIR = os.path.join(DEFAULT_STEAM_ROOT, "config/stplug-in")
 DEFAULT_SLS_DIR = os.path.expanduser("~/.config/SLSsteam")
 DEFAULT_BACKUP_DIR = os.path.expanduser("~/SteamLibrary-Backups")
+GAMES_BACKUP_DIR = os.path.join(DEFAULT_BACKUP_DIR, "games")
+ARCHIVES_BACKUP_DIR = os.path.join(DEFAULT_BACKUP_DIR, "archives")
+INDEX_FILE = os.path.join(DEFAULT_BACKUP_DIR, "index.json")
 NAMES_CACHE_FILE = os.path.expanduser("~/.config/steam-library-manager/names_cache.json")
-def _resolve_repo_dir():
-    candidates = [
-        os.path.abspath(os.path.join(os.path.dirname(__file__), "..")),
-        os.path.expanduser("~/.local/share/Steam/plugins/steam-library-manager"),
-        os.path.expanduser("~/WorkSpace/Code/steam-library-manager")
-    ]
-    for c in candidates:
-        if os.path.exists(os.path.join(c, "frontend/styles.css")):
-            return c
-    return candidates[0]
+REPO_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
-REPO_DIR = _resolve_repo_dir()
-
-def is_runtime_tool(name="", installdir=""):
-    s = (str(name) + " " + str(installdir)).lower()
-    return any(k in s for k in [
-        "proton",
-        "steam linux runtime",
-        "steamworks shared",
-        "steam controller configs",
-        "steamworks common redistributables",
-        "steamvr"
-    ])
+os.makedirs(GAMES_BACKUP_DIR, exist_ok=True)
+os.makedirs(ARCHIVES_BACKUP_DIR, exist_ok=True)
 
 def get_steam_libraries():
     roots = [DEFAULT_STEAM_ROOT]
@@ -61,6 +51,22 @@ def get_steam_libraries():
         except Exception:
             pass
     return roots
+
+def load_index():
+    if os.path.exists(INDEX_FILE):
+        try:
+            with open(INDEX_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+def save_index(index_data):
+    try:
+        with open(INDEX_FILE, "w", encoding="utf-8") as f:
+            json.dump(index_data, f, indent=2)
+    except Exception:
+        pass
 
 def load_names_cache():
     if os.path.exists(NAMES_CACHE_FILE):
@@ -93,7 +99,8 @@ def fetch_live_names_from_steam():
         try:
             out = subprocess.check_output(["pgrep", "-a", "steamwebhelper"]).decode()
             m = re.search(r'--remote-debugging-port=(\d+)', out)
-            if m: port = m.group(1)
+            if m:
+                port = m.group(1)
         except Exception:
             pass
     if not port:
@@ -169,7 +176,7 @@ def resolve_all_dynamic_names():
                 mname = re.search(r'"name"\s+"([^"]+)"', txt)
                 if aid and mname:
                     a = int(aid.group(1))
-                    if not is_runtime_tool(mname.group(1)):
+                    if a not in [228980, 1493710, 4183110]:
                         if a not in names:
                             names[a] = mname.group(1)
             except Exception:
@@ -178,11 +185,23 @@ def resolve_all_dynamic_names():
     save_names_cache(names)
     return names
 
+def get_game_backup_dir(appid, clean_name=""):
+    # Look for existing directory starting with {appid}_
+    if os.path.exists(GAMES_BACKUP_DIR):
+        for entry in os.listdir(GAMES_BACKUP_DIR):
+            if entry.startswith(f"{appid}_") or entry == str(appid):
+                return os.path.join(GAMES_BACKUP_DIR, entry)
+    clean = re.sub(r'[^a-zA-Z0-9_\-]', '_', clean_name).strip('_')
+    folder_name = f"{appid}_{clean}" if clean else str(appid)
+    return os.path.join(GAMES_BACKUP_DIR, folder_name)
+
 def get_all_library_games():
     names = resolve_all_dynamic_names()
+    index_data = load_index()
     games_map = {}
     roots = get_steam_libraries()
 
+    # 1. Scan physical installations
     for r in set(roots):
         for acf in glob.glob(os.path.join(r, "steamapps/appmanifest_*.acf")):
             try:
@@ -196,7 +215,7 @@ def get_all_library_games():
 
                 if aid and name:
                     a = int(aid.group(1))
-                    if is_runtime_tool(name.group(1), inst_dir.group(1) if inst_dir else ""):
+                    if a in [228980, 1493710, 4183110]:
                         continue
                     display_name = names.get(a, name.group(1))
                     names[a] = display_name
@@ -216,6 +235,7 @@ def get_all_library_games():
             except Exception:
                 pass
 
+    # 2. Scan stplug-in for LuaTools manifests
     if os.path.exists(DEFAULT_STPLUG_DIR):
         for f in os.listdir(DEFAULT_STPLUG_DIR):
             if not f.endswith(".lua"):
@@ -253,8 +273,9 @@ def get_all_library_games():
                 games_map[a]["depots"] = depots
                 games_map[a]["source"] = "Official / LuaTools"
 
+    # 3. Add known account games
     for a, gname in names.items():
-        if a not in games_map and not is_runtime_tool(gname):
+        if a not in games_map and a not in [228980, 1493710, 4183110]:
             games_map[a] = {
                 "appid": a,
                 "name": gname,
@@ -265,12 +286,34 @@ def get_all_library_games():
                 "source": "Official Steam Account"
             }
 
-    return [games_map[k] for k in sorted(games_map.keys(), key=lambda x: str(games_map[x]["name"]).lower())]
+    # Attach backup status & timestamp from index & filesystem
+    game_list = []
+    for a, g in games_map.items():
+        str_a = str(a)
+        idx_info = index_data.get(str_a)
+        bdir = get_game_backup_dir(a, g["name"])
+        backed_up = os.path.exists(bdir) and os.listdir(bdir)
 
-def export_games(appids=None, backup_name=None, backup_dir=DEFAULT_BACKUP_DIR):
+        if backed_up:
+            last_ts = idx_info.get("timestamp") if idx_info else os.path.getmtime(bdir)
+            last_str = idx_info.get("last_synced") if idx_info else datetime.fromtimestamp(last_ts).strftime("%Y-%m-%d %H:%M")
+        else:
+            last_ts = 0
+            last_str = "Never"
+
+        g["backed_up"] = bool(backed_up)
+        g["last_synced"] = last_str
+        g["last_synced_ts"] = last_ts
+        g["backup_dir"] = bdir
+        game_list.append(g)
+
+    return sorted(game_list, key=lambda x: str(x["name"]).lower())
+
+# Sync / Backup Logic (creates/replaces per-game subdirectory in single source of truth)
+def sync_games(appids=None, create_tar=True, tar_name=None):
     all_games = get_all_library_games()
     if not all_games:
-        return {"success": False, "error": "No games found in Steam library"}
+        return {"success": False, "error": "No games found in library"}
 
     if appids is None or appids == "all":
         selected_games = all_games
@@ -279,29 +322,11 @@ def export_games(appids=None, backup_name=None, backup_dir=DEFAULT_BACKUP_DIR):
         selected_games = [g for g in all_games if g["appid"] in req_set]
 
     if not selected_games:
-        return {"success": False, "error": "No matching games selected to export"}
+        return {"success": False, "error": "No games selected to sync"}
 
-    os.makedirs(backup_dir, exist_ok=True)
-    ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    if not backup_name:
-        if len(selected_games) == 1:
-            clean_name = re.sub(r'[^a-zA-Z0-9_\-]', '_', str(selected_games[0]["name"]))
-            backup_name = f"game_{selected_games[0]['appid']}_{clean_name}_{ts}.zip"
-        elif len(selected_games) == len(all_games):
-            backup_name = f"steam_library_full_{ts}.zip"
-        else:
-            backup_name = f"steam_library_{len(selected_games)}_games_{ts}.zip"
-
-    if not backup_name.endswith(".zip"):
-        backup_name += ".zip"
-
-    zip_path = os.path.join(backup_dir, backup_name)
-    metadata = {
-        "version": "2.0",
-        "created_at": ts,
-        "total_games": len(selected_games),
-        "games": selected_games
-    }
+    index_data = load_index()
+    now_ts = time.time()
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     manifests_dir = os.path.join(DEFAULT_SLS_DIR, "manifests")
     all_depots = set()
@@ -309,179 +334,583 @@ def export_games(appids=None, backup_name=None, backup_dir=DEFAULT_BACKUP_DIR):
         for d in g.get("depots", []):
             all_depots.add(d)
 
-    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr("metadata.json", json.dumps(metadata, indent=2))
+    synced_folders = []
 
-        for g in selected_games:
-            if g.get("has_lua") and g.get("lua_file"):
-                src = os.path.join(DEFAULT_STPLUG_DIR, g["lua_file"])
-                if os.path.exists(src):
-                    zf.write(src, f"stplug-in/{g['lua_file']}")
+    for g in selected_games:
+        aid = g["appid"]
+        bdir = get_game_backup_dir(aid, g["name"])
+        # Replace existing game directory cleanly
+        if os.path.exists(bdir):
+            shutil.rmtree(bdir)
+        os.makedirs(bdir, exist_ok=True)
 
-            if g.get("has_acf") and g.get("acf_path"):
-                if os.path.exists(g["acf_path"]):
-                    fname = os.path.basename(g["acf_path"])
-                    zf.write(g["acf_path"], f"acfs/{fname}")
+        saved_files = []
 
-        if os.path.exists(manifests_dir) and all_depots:
+        # 1. Copy Lua script if present
+        if g.get("has_lua") and g.get("lua_file"):
+            src_lua = os.path.join(DEFAULT_STPLUG_DIR, g["lua_file"])
+            if os.path.exists(src_lua):
+                shutil.copy2(src_lua, os.path.join(bdir, g["lua_file"]))
+                saved_files.append(g["lua_file"])
+
+        # 2. Copy ACF manifest if present
+        if g.get("has_acf") and g.get("acf_path") and os.path.exists(g["acf_path"]):
+            fname = os.path.basename(g["acf_path"])
+            shutil.copy2(g["acf_path"], os.path.join(bdir, fname))
+            saved_files.append(fname)
+
+        # 3. Copy referenced depot manifests
+        if os.path.exists(manifests_dir) and g.get("depots"):
+            g_man_dir = os.path.join(bdir, "manifests")
             for mfile in os.listdir(manifests_dir):
                 m_match = re.match(r"^(\d+)_\d+\.manifest$", mfile)
-                if m_match and int(m_match.group(1)) in all_depots:
-                    msrc = os.path.join(manifests_dir, mfile)
-                    zf.write(msrc, f"manifests/{mfile}")
+                if m_match and int(m_match.group(1)) in g.get("depots", []):
+                    os.makedirs(g_man_dir, exist_ok=True)
+                    shutil.copy2(os.path.join(manifests_dir, mfile), os.path.join(g_man_dir, mfile))
+                    saved_files.append(f"manifests/{mfile}")
 
-        lat = os.path.join(DEFAULT_SLS_DIR, "library-added-times.txt")
-        if os.path.exists(lat):
-            zf.write(lat, "sls/library-added-times.txt")
+        # 4. Save metadata.json inside the game's subdirectory
+        meta = {
+            "appid": aid,
+            "name": g["name"],
+            "source": g["source"],
+            "installed": g["installed"],
+            "size_on_disk": g.get("size_on_disk", 0),
+            "last_synced": now_str,
+            "timestamp": now_ts,
+            "files": saved_files
+        }
+        with open(os.path.join(bdir, "metadata.json"), "w", encoding="utf-8") as mf:
+            json.dump(meta, mf, indent=2)
+
+        # Update global index.json
+        index_data[str(aid)] = meta
+        synced_folders.append(bdir)
+
+    save_index(index_data)
+
+    archive_path = None
+    if create_tar:
+        ts_tag = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        if not tar_name:
+            if len(selected_games) == 1:
+                clean = re.sub(r'[^a-zA-Z0-9_\-]', '_', str(selected_games[0]["name"])).strip('_')
+                tar_name = f"backup_{selected_games[0]['appid']}_{clean}_{ts_tag}.tar.gz"
+            else:
+                tar_name = f"backup_{len(selected_games)}_games_{ts_tag}.tar.gz"
+
+        if not tar_name.endswith(".tar.gz") and not tar_name.endswith(".zip"):
+            tar_name += ".tar.gz"
+
+        archive_path = os.path.join(ARCHIVES_BACKUP_DIR, tar_name)
+        with tarfile.open(archive_path, "w:gz") as tar:
+            for sdir in synced_folders:
+                folder_base = os.path.basename(sdir)
+                tar.add(sdir, arcname=f"games/{folder_base}")
+            # Add index slice
+            tar.add(INDEX_FILE, arcname="index.json")
 
     return {
         "success": True,
-        "path": zip_path,
-        "backup_name": backup_name,
-        "count": len(selected_games),
+        "synced_count": len(selected_games),
+        "archive_path": archive_path,
+        "archive_name": os.path.basename(archive_path) if archive_path else None,
         "games": selected_games
     }
 
-def list_backups(backup_dir=DEFAULT_BACKUP_DIR):
-    if not os.path.exists(backup_dir):
-        return []
-    names = resolve_all_dynamic_names()
-    backups = []
-    for f in sorted(os.listdir(backup_dir), reverse=True):
-        if not f.endswith(".zip"):
-            continue
-        p = os.path.join(backup_dir, f)
-        size = os.path.getsize(p)
-        mtime = os.path.getmtime(p)
-        games_list = []
+# Inspect what games are inside an archive or directory
+def inspect_source(source_type="directory", archive_path=None):
+    games = []
+    if source_type == "directory":
+        # Read from single source of truth GAMES_BACKUP_DIR
+        if not os.path.exists(GAMES_BACKUP_DIR):
+            return games
+        index_data = load_index()
+        for folder in sorted(os.listdir(GAMES_BACKUP_DIR)):
+            fpath = os.path.join(GAMES_BACKUP_DIR, folder)
+            if not os.path.isdir(fpath): continue
+            meta_path = os.path.join(fpath, "metadata.json")
+            if os.path.exists(meta_path):
+                try:
+                    with open(meta_path, "r", encoding="utf-8") as mf:
+                        games.append(json.load(mf))
+                    continue
+                except Exception:
+                    pass
+            # Fallback parse folder name
+            m = re.match(r"^(\d+)", folder)
+            if m:
+                aid = int(m.group(1))
+                idx_g = index_data.get(str(aid), {})
+                games.append({"appid": aid, "name": idx_g.get("name", folder), "source": "Backup Folder"})
+        return games
+
+    # Inspect archive file (.tar.gz or .zip)
+    if not archive_path or not os.path.exists(archive_path):
+        return games
+
+    if archive_path.endswith(".tar.gz") or archive_path.endswith(".tgz") or archive_path.endswith(".tar"):
         try:
-            with zipfile.ZipFile(p, "r") as zf:
-                if "metadata.json" in zf.namelist():
-                    meta = json.loads(zf.read("metadata.json").decode("utf-8"))
-                    games_list = meta.get("games", [])
-                else:
-                    for n in zf.namelist():
-                        if n.startswith("stplug-in/") and n.endswith(".lua"):
-                            aid = int(n[10:-4])
-                            games_list.append({"appid": aid, "name": names.get(aid, f"AppID {aid}")})
-                        elif n.startswith("acfs/appmanifest_") and n.endswith(".acf"):
-                            aid = int(n[17:-4])
-                            games_list.append({"appid": aid, "name": names.get(aid, f"AppID {aid}")})
+            with tarfile.open(archive_path, "r:*") as tar:
+                # Look for metadata files
+                for member in tar.getmembers():
+                    if member.name.endswith("metadata.json") and member.isfile():
+                        f = tar.extractfile(member)
+                        if f:
+                            games.append(json.loads(f.read().decode("utf-8")))
         except Exception:
             pass
 
-        backups.append({
+    elif archive_path.endswith(".zip"):
+        try:
+            with zipfile.ZipFile(archive_path, "r") as zf:
+                if "metadata.json" in zf.namelist():
+                    meta = json.loads(zf.read("metadata.json").decode("utf-8"))
+                    games = meta.get("games", [])
+        except Exception:
+            pass
+
+    return games
+
+# List available archive files
+def list_archives():
+    if not os.path.exists(ARCHIVES_BACKUP_DIR):
+        return []
+    archives = []
+    for f in sorted(os.listdir(ARCHIVES_BACKUP_DIR), reverse=True):
+        if not (f.endswith(".tar.gz") or f.endswith(".zip") or f.endswith(".tgz")):
+            continue
+        p = os.path.join(ARCHIVES_BACKUP_DIR, f)
+        size = os.path.getsize(p)
+        mtime = os.path.getmtime(p)
+        games = inspect_source("archive", p)
+        archives.append({
             "filename": f,
             "path": p,
             "size": size,
             "mtime": mtime,
-            "count": len(games_list),
-            "games": games_list
+            "count": len(games),
+            "games": games
         })
-    return backups
+    return archives
 
-def delete_backup(filename_or_path, backup_dir=DEFAULT_BACKUP_DIR):
-    if not filename_or_path:
-        return {"success": False, "error": "No filename specified"}
-    fname = os.path.basename(filename_or_path)
-    target = os.path.join(backup_dir, fname)
-    if not os.path.exists(target):
-        return {"success": False, "error": f"Backup file not found: {fname}"}
-    try:
-        os.remove(target)
-        return {"success": True, "filename": fname}
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
-def restore_games(backup_path=None, appids=None, backup_dir=DEFAULT_BACKUP_DIR):
-    if not backup_path:
-        all_b = list_backups(backup_dir)
-        if not all_b:
-            return {"success": False, "error": "No backup files found to restore from"}
-        backup_path = all_b[0]["path"]
-
-    if not os.path.exists(backup_path):
-        return {"success": False, "error": f"Backup file not found: {backup_path}"}
-
-    names = resolve_all_dynamic_names()
+# Universal Restore Logic (from directory or archive, all or selected)
+def restore_games(source_type="directory", archive_path=None, appids=None):
     os.makedirs(DEFAULT_STPLUG_DIR, exist_ok=True)
     manifests_dir = os.path.join(DEFAULT_SLS_DIR, "manifests")
     os.makedirs(manifests_dir, exist_ok=True)
     steamapps_dir = os.path.join(DEFAULT_STEAM_ROOT, "steamapps")
     os.makedirs(steamapps_dir, exist_ok=True)
 
+    target_appids = None
+    if appids is not None and appids != "all":
+        target_appids = set(int(a) for a in appids)
+
     restored = []
-    with zipfile.ZipFile(backup_path, "r") as zf:
-        namelist = zf.namelist()
-        meta = {}
-        if "metadata.json" in namelist:
-            try:
-                meta = json.loads(zf.read("metadata.json").decode("utf-8"))
-            except Exception:
-                pass
 
-        available_games = meta.get("games", [])
-        avail_map = {g["appid"]: g for g in available_games}
+    # 1. Restore from single source of truth directory (games/)
+    if source_type == "directory":
+        if not os.path.exists(GAMES_BACKUP_DIR):
+            return {"success": False, "error": "No games backup directory found"}
 
-        target_appids = None
-        if appids is not None and appids != "all":
-            target_appids = set(int(a) for a in appids)
+        for folder in os.listdir(GAMES_BACKUP_DIR):
+            fpath = os.path.join(GAMES_BACKUP_DIR, folder)
+            if not os.path.isdir(fpath): continue
 
-        for member in namelist:
-            if member.startswith("stplug-in/") and member.endswith(".lua"):
-                fname = os.path.basename(member)
+            meta_file = os.path.join(fpath, "metadata.json")
+            meta = {}
+            if os.path.exists(meta_file):
                 try:
-                    aid = int(fname[:-4])
-                except ValueError:
-                    continue
-                if target_appids is not None and aid not in target_appids:
-                    continue
+                    with open(meta_file, "r", encoding="utf-8") as mf:
+                        meta = json.load(mf)
+                except Exception:
+                    pass
 
-                dest = os.path.join(DEFAULT_STPLUG_DIR, fname)
-                with open(dest, "wb") as f:
-                    f.write(zf.read(member))
+            aid = meta.get("appid")
+            if not aid:
+                m = re.match(r"^(\d+)", folder)
+                aid = int(m.group(1)) if m else None
 
-                g_info = avail_map.get(aid, {"appid": aid, "name": names.get(aid, f"AppID {aid}")})
-                if g_info not in restored:
-                    restored.append(g_info)
+            if not aid: continue
+            if target_appids is not None and aid not in target_appids:
+                continue
 
-            elif member.startswith("acfs/") and member.endswith(".acf"):
-                fname = os.path.basename(member)
-                aid_match = re.search(r"appmanifest_(\d+)\.acf", fname)
-                if aid_match:
-                    aid = int(aid_match.group(1))
+            # Restore Lua file
+            lua_src = os.path.join(fpath, f"{aid}.lua")
+            if os.path.exists(lua_src):
+                shutil.copy2(lua_src, os.path.join(DEFAULT_STPLUG_DIR, f"{aid}.lua"))
+
+            # Restore ACF file
+            for af in glob.glob(os.path.join(fpath, "appmanifest_*.acf")):
+                shutil.copy2(af, os.path.join(steamapps_dir, os.path.basename(af)))
+
+            # Restore depot manifests
+            man_src = os.path.join(fpath, "manifests")
+            if os.path.exists(man_src):
+                for mf in os.listdir(man_src):
+                    shutil.copy2(os.path.join(man_src, mf), os.path.join(manifests_dir, mf))
+
+            restored.append({"appid": aid, "name": meta.get("name", folder)})
+
+        return {"success": True, "restored_count": len(restored), "games": restored, "source": "Single Source Directory"}
+
+    # 2. Restore from archive file (.tar.gz / .zip)
+    if not archive_path or not os.path.exists(archive_path):
+        return {"success": False, "error": f"Archive file not found: {archive_path}"}
+
+    if archive_path.endswith(".tar.gz") or archive_path.endswith(".tgz") or archive_path.endswith(".tar"):
+        with tarfile.open(archive_path, "r:*") as tar:
+            for member in tar.getmembers():
+                if not member.isfile(): continue
+                bname = os.path.basename(member.name)
+
+                # Check if it's a Lua file
+                if bname.endswith(".lua"):
+                    try:
+                        aid = int(bname[:-4])
+                    except ValueError:
+                        continue
                     if target_appids is not None and aid not in target_appids:
                         continue
+                    f = tar.extractfile(member)
+                    if f:
+                        with open(os.path.join(DEFAULT_STPLUG_DIR, bname), "wb") as out:
+                            out.write(f.read())
+                        restored.append({"appid": aid, "name": f"AppID {aid}"})
 
-                    target_lib = steamapps_dir
-                    if aid in avail_map and avail_map[aid].get("library_path"):
-                        lib_p = avail_map[aid]["library_path"]
-                        if os.path.exists(lib_p):
-                            target_lib = os.path.join(lib_p, "steamapps")
+                # Check if it's an ACF file
+                elif bname.startswith("appmanifest_") and bname.endswith(".acf"):
+                    aid_m = re.search(r"appmanifest_(\d+)\.acf", bname)
+                    if aid_m:
+                        aid = int(aid_m.group(1))
+                        if target_appids is not None and aid not in target_appids:
+                            continue
+                        f = tar.extractfile(member)
+                        if f:
+                            with open(os.path.join(steamapps_dir, bname), "wb") as out:
+                                out.write(f.read())
+                            if not any(r["appid"] == aid for r in restored):
+                                restored.append({"appid": aid, "name": f"AppID {aid}"})
 
-                    dest = os.path.join(target_lib, fname)
-                    with open(dest, "wb") as f:
-                        f.write(zf.read(member))
+                # Check if it's a depot manifest
+                elif bname.endswith(".manifest"):
+                    f = tar.extractfile(member)
+                    if f:
+                        with open(os.path.join(manifests_dir, bname), "wb") as out:
+                            out.write(f.read())
 
-                    g_info = avail_map.get(aid, {"appid": aid, "name": names.get(aid, f"AppID {aid}")})
-                    if g_info not in restored:
-                        restored.append(g_info)
+    elif archive_path.endswith(".zip"):
+        with zipfile.ZipFile(archive_path, "r") as zf:
+            for name in zf.namelist():
+                bname = os.path.basename(name)
+                if bname.endswith(".lua"):
+                    try:
+                        aid = int(bname[:-4])
+                    except ValueError:
+                        continue
+                    if target_appids is not None and aid not in target_appids:
+                        continue
+                    with open(os.path.join(DEFAULT_STPLUG_DIR, bname), "wb") as out:
+                        out.write(zf.read(name))
+                    restored.append({"appid": aid, "name": f"AppID {aid}"})
 
-            elif member.startswith("manifests/") and member.endswith(".manifest"):
-                fname = os.path.basename(member)
-                dest = os.path.join(manifests_dir, fname)
-                with open(dest, "wb") as f:
-                    f.write(zf.read(member))
+                elif bname.startswith("appmanifest_") and bname.endswith(".acf"):
+                    aid_m = re.search(r"appmanifest_(\d+)\.acf", bname)
+                    if aid_m:
+                        aid = int(aid_m.group(1))
+                        if target_appids is not None and aid not in target_appids:
+                            continue
+                        with open(os.path.join(steamapps_dir, bname), "wb") as out:
+                            out.write(zf.read(name))
+                        if not any(r["appid"] == aid for r in restored):
+                            restored.append({"appid": aid, "name": f"AppID {aid}"})
 
-            elif member == "sls/library-added-times.txt":
-                dest = os.path.join(DEFAULT_SLS_DIR, "library-added-times.txt")
-                if not os.path.exists(dest):
-                    with open(dest, "wb") as f:
-                        f.write(zf.read(member))
+    names = resolve_all_dynamic_names()
+    for r in restored:
+        if r["appid"] in names:
+            r["name"] = names[r["appid"]]
 
-    return {
-        "success": True,
-        "restored_count": len(restored),
-        "games": restored,
-        "backup_path": backup_path
-    }
+    return {"success": True, "restored_count": len(restored), "games": restored, "source": os.path.basename(archive_path)}
+
+def delete_archive_file(filename):
+    fname = os.path.basename(filename)
+    target = os.path.join(ARCHIVES_BACKUP_DIR, fname)
+    if not os.path.exists(target):
+        return {"success": False, "error": f"File not found: {fname}"}
+    try:
+        os.remove(target)
+        return {"success": True, "filename": fname}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+# In-Memory CEF Injector
+def inject_into_steam():
+    port_file = os.path.expanduser("~/.local/share/Lumen/cef_port")
+    port = None
+    if os.path.exists(port_file):
+        try:
+            with open(port_file, "r") as f:
+                port = f.read().split("\n")[0].strip()
+        except Exception:
+            pass
+
+    if not port:
+        try:
+            out = subprocess.check_output(["pgrep", "-a", "steamwebhelper"]).decode()
+            m = re.search(r'--remote-debugging-port=(\d+)', out)
+            if m: port = m.group(1)
+        except Exception:
+            pass
+
+    if not port:
+        return False, "Could not locate Steam remote debugging port"
+
+    node_script = f"""
+    const fs = require('fs');
+    const path = '{REPO_DIR}';
+    const css = fs.readFileSync(path + '/frontend/styles.css', 'utf8');
+    const js = fs.readFileSync(path + '/frontend/index.js', 'utf8');
+
+    async function run() {{
+      const res = await fetch('http://127.0.0.1:{port}/json');
+      const pages = await res.json();
+      const steam = pages.find(p => p.title === 'Steam');
+      if (!steam) return process.exit(1);
+
+      const ws = new WebSocket(steam.webSocketDebuggerUrl);
+      ws.onopen = () => {{
+        const code = `
+          (function() {{
+            const oldStyles = document.getElementById('slm-styles');
+            if (oldStyles) oldStyles.remove();
+            const s = document.createElement('style');
+            s.id = 'slm-styles';
+            s.textContent = ${{JSON.stringify(css)}};
+            document.head.appendChild(s);
+            ${{js}}
+            return true;
+          }})()
+        `;
+        ws.send(JSON.stringify({{ id: 1, method: 'Runtime.evaluate', params: {{ expression: code, returnByValue: true }} }}));
+      }};
+      ws.onmessage = () => process.exit(0);
+      ws.onerror = () => process.exit(1);
+    }}
+    run();
+    """
+    try:
+        res = subprocess.run(["node", "-e", node_script], capture_output=True, timeout=5)
+        return res.returncode == 0, "Injected"
+    except Exception as e:
+        return False, str(e)
+
+# HTTP Request Handler with CORS
+class RequestHandler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, format, *args):
+        pass
+
+    def send_cors_headers(self):
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+
+    def do_OPTIONS(self):
+        self.send_response(200)
+        self.send_cors_headers()
+        self.end_headers()
+
+    def do_GET(self):
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path in ["/api/games", "/api/status"]:
+            games = get_all_library_games()
+            archives = list_archives()
+            data = {"success": True, "games": games, "archives": archives, "total": len(games)}
+            self.send_response(200)
+            self.send_cors_headers()
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps(data).encode("utf-8"))
+            return
+
+        elif parsed.path == "/api/archives":
+            archives = list_archives()
+            data = {"success": True, "archives": archives}
+            self.send_response(200)
+            self.send_cors_headers()
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps(data).encode("utf-8"))
+            return
+
+        self.send_response(200)
+        self.send_cors_headers()
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(b"<h1>Steam Library Manager API Service</h1>")
+
+    def do_POST(self):
+        parsed = urllib.parse.urlparse(self.path)
+        length = int(self.headers.get('Content-Length', 0))
+        body = self.rfile.read(length).decode('utf-8')
+        try:
+            payload = json.loads(body) if body else {}
+        except Exception:
+            payload = {}
+
+        if parsed.path == "/api/sync":
+            appids = payload.get("appids")
+            create_tar = bool(payload.get("create_archive", False))
+            tar_name = payload.get("archive_name")
+            result = sync_games(appids=appids, create_tar=create_tar, tar_name=tar_name)
+
+        elif parsed.path == "/api/inspect":
+            source_type = payload.get("source_type", "directory")
+            archive_path = payload.get("archive_path")
+            if archive_path and not os.path.isabs(archive_path):
+                archive_path = os.path.join(ARCHIVES_BACKUP_DIR, archive_path)
+            games = inspect_source(source_type, archive_path)
+            result = {"success": True, "games": games}
+
+        elif parsed.path == "/api/restore":
+            source_type = payload.get("source_type", "directory")
+            archive_path = payload.get("archive_path")
+            if archive_path and not os.path.isabs(archive_path):
+                archive_path = os.path.join(ARCHIVES_BACKUP_DIR, archive_path)
+            appids = payload.get("appids")
+            result = restore_games(source_type=source_type, archive_path=archive_path, appids=appids)
+
+        elif parsed.path in ["/api/delete_archive", "/api/delete_backup"]:
+            filename = payload.get("filename") or payload.get("archive_name")
+            result = delete_archive_file(filename)
+
+        elif parsed.path == "/api/inject":
+            ok, msg = inject_into_steam()
+            result = {"success": ok, "message": msg}
+
+        else:
+            self.send_response(404)
+            self.end_headers()
+            return
+
+        self.send_response(200)
+        self.send_cors_headers()
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(json.dumps(result).encode("utf-8"))
+
+def run_server(port=8343):
+    server = http.server.HTTPServer(("127.0.0.1", port), RequestHandler)
+    server.serve_forever()
+
+def run_daemon(port=8343):
+    print(f"[SLM Daemon] Starting single-source daemon on 127.0.0.1:{port}...")
+    t = threading.Thread(target=run_server, args=(port,), daemon=True)
+    t.start()
+
+    last_injected = 0
+    while True:
+        try:
+            time.sleep(3)
+            now = time.time()
+            if now - last_injected > 5:
+                ok, _ = inject_into_steam()
+                if ok:
+                    last_injected = now
+        except KeyboardInterrupt:
+            break
+        except Exception:
+            pass
+
+def main():
+    parser = argparse.ArgumentParser(description="Steam Library Manager - Single Source of Truth Backup & Restore")
+    subparsers = parser.add_subparsers(dest="command")
+
+    subparsers.add_parser("list", help="List all Steam games in library")
+
+    # sync
+    p_sync = subparsers.add_parser("sync", help="Sync/backup games into single-source subdirectories")
+    p_sync.add_argument("--all", action="store_true", help="Sync all games")
+    p_sync.add_argument("--games", type=str, help="Comma-separated AppIDs to sync")
+    p_sync.add_argument("--game", type=int, help="Single AppID to sync")
+    p_sync.add_argument("--tar", action="store_true", help="Also generate .tar.gz archive bundle")
+
+    # restore
+    p_restore = subparsers.add_parser("restore", help="Restore games from directory or archive")
+    p_restore.add_argument("--dir", action="store_true", help="Restore from single-source directory")
+    p_restore.add_argument("--archive", type=str, help="Restore from specific archive bundle (.tar.gz)")
+    p_restore.add_argument("--all", action="store_true", help="Restore all games")
+    p_restore.add_argument("--games", type=str, help="Comma-separated AppIDs to restore")
+
+    # archives
+    subparsers.add_parser("archives", help="List available archive bundles")
+
+    subparsers.add_parser("daemon", help="Run background daemon")
+    subparsers.add_parser("inject", help="Inject into running Steam")
+
+    args = parser.parse_args()
+
+    if not args.command or args.command == "list":
+        games = get_all_library_games()
+        print(f"\n🎮 Universal Steam Library ({len(games)} total):")
+        print("─" * 90)
+        for g in games:
+            st = "INSTALLED" if g["installed"] else "IN LIBRARY"
+            sz_str = f" ({g['size_on_disk'] / (1024**3):.1f} GB)" if g["installed"] and g.get("size_on_disk") else ""
+            sync_st = f"SYNCED ({g['last_synced']})" if g["backed_up"] else "NOT SYNCED"
+            print(f"[{g['appid']:7d}] {g['name']:<38} | {st:<12} | {sync_st}")
+        print("─" * 90)
+        return
+
+    if args.command == "sync":
+        appids = None
+        if args.all:
+            appids = "all"
+        elif args.games:
+            appids = [int(x.strip()) for x in args.games.split(",") if x.strip()]
+        elif args.game:
+            appids = [args.game]
+        else:
+            print("Specify --all, --games <id1,id2>, or --game <id>")
+            return
+
+        res = sync_games(appids=appids, create_tar=args.tar)
+        if res["success"]:
+            print(f"\n✓ Successfully synced {res['synced_count']} game(s) to {GAMES_BACKUP_DIR}")
+            if res.get("archive_path"):
+                print(f"  Archive created: {res['archive_path']}")
+        else:
+            print(f"\n✗ Sync failed: {res['error']}")
+
+    elif args.command == "archives":
+        archs = list_archives()
+        print(f"\n📦 Available Archives in {ARCHIVES_BACKUP_DIR}:")
+        print("─" * 80)
+        if not archs:
+            print("No archives found.")
+        for a in archs:
+            dt = datetime.fromtimestamp(a["mtime"]).strftime("%Y-%m-%d %H:%M:%S")
+            sz = f"{a['size'] / 1024:.1f} KB"
+            print(f"{a['filename']:<48} {a['count']:2d} games | {sz} | {dt}")
+        print("─" * 80)
+
+    elif args.command == "restore":
+        source_type = "archive" if args.archive else "directory"
+        appids = "all" if args.all else ([int(x.strip()) for x in args.games.split(",")] if args.games else "all")
+        res = restore_games(source_type=source_type, archive_path=args.archive, appids=appids)
+        if res["success"]:
+            print(f"\n✓ Successfully restored {res['restored_count']} game(s) from {res['source']}!")
+            for g in res["games"]:
+                print(f"  + [{g['appid']}] {g['name']}")
+            print("\n→ Restart Steam to refresh your library.")
+        else:
+            print(f"\n✗ Restore failed: {res['error']}")
+
+    elif args.command == "daemon":
+        run_daemon()
+
+    elif args.command == "inject":
+        ok, msg = inject_into_steam()
+        print(f"[{'✓' if ok else '✗'}] {msg}")
+
+if __name__ == "__main__":
+    main()
