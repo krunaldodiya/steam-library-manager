@@ -10,18 +10,8 @@
   const API_PORT = 8343;
   const BACKEND_URL = `http://127.0.0.1:${API_PORT}`;
 
-  // Backend Bridge (Supports Millennium Plugin API or Standalone Local Daemon)
+  // Dedicated Backend Bridge
   async function apiCall(method, params = {}) {
-    if (window.Millennium && window.Millennium.callServerMethod) {
-      try {
-        const res = await window.Millennium.callServerMethod("steam-library-manager", method, params);
-        return typeof res === "string" ? JSON.parse(res) : res;
-      } catch (e) {
-        console.warn("[SLM] Millennium bridge failed, falling back to local daemon:", e);
-      }
-    }
-
-    // Fallback: Local daemon HTTP call
     const endpointMap = {
       "get_games": "/api/games",
       "get_backups": "/api/backups",
@@ -53,7 +43,10 @@
 
   // Build Modal Dialog
   function openManagerModal() {
-    if (document.getElementById("slm-modal-overlay")) return;
+    let existing = document.getElementById("slm-modal-overlay");
+    if (existing) {
+      existing.remove();
+    }
 
     let state = {
       activeTab: "export",
@@ -123,7 +116,7 @@
         content.innerHTML = `
           <div style="text-align:center;padding:40px;color:#ec5c5c;">
             Failed to connect to backend engine.<br>
-            <small style="color:#8f98a0;">Make sure steam-library-manager daemon is running.</small>
+            <small style="color:#8f98a0;">Make sure steam-library-manager daemon is running (port ${API_PORT}).</small>
           </div>
         `;
       }
@@ -340,7 +333,6 @@
   function injectTopBarButton() {
     if (document.getElementById("slm-topbar-btn")) return;
 
-    // Anchor near top right window controls or menubar
     const target = document.querySelector(".title-area-icon-inner")?.parentElement?.parentElement ||
                    document.querySelector("._2D64jIEK7wpUR_NlObDW76") ||
                    document.querySelector(".RootMenuBar") ||
@@ -358,10 +350,8 @@
     target.appendChild(btn);
   }
 
-  // Polling / MutationObserver to keep button present across Steam window navigation
   setInterval(injectTopBarButton, 2000);
   injectTopBarButton();
 
-  // Expose Global Helper
   window.OpenSteamLibraryManager = openManagerModal;
 })();

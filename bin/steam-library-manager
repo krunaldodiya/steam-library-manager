@@ -13,6 +13,10 @@ import time
 import shutil
 import zipfile
 import argparse
+import threading
+import subprocess
+import http.server
+import urllib.parse
 from datetime import datetime
 from pathlib import Path
 
@@ -21,6 +25,7 @@ DEFAULT_STEAM_ROOT = os.path.expanduser("~/.local/share/Steam")
 DEFAULT_STPLUG_DIR = os.path.join(DEFAULT_STEAM_ROOT, "config/stplug-in")
 DEFAULT_SLS_DIR = os.path.expanduser("~/.config/SLSsteam")
 DEFAULT_BACKUP_DIR = os.path.expanduser("~/SteamLibrary-Backups")
+REPO_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
 KNOWN_NAMES = {
     730: "Counter-Strike 2", 204100: "Max Payne 3", 292030: "The Witcher 3: Wild Hunt",
@@ -104,7 +109,6 @@ def get_managed_games():
         game_name = names.get(aid, f"AppID {aid}")
         is_inst = aid in installed
 
-        # Extract depots from lua
         depots = []
         try:
             with open(fpath, "r", encoding="utf-8", errors="ignore") as lf:
@@ -168,13 +172,11 @@ def export_games(appids=None, backup_name=None, backup_dir=DEFAULT_BACKUP_DIR):
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("metadata.json", json.dumps(metadata, indent=2))
 
-        # Add .lua files
         for g in selected_games:
             src = os.path.join(DEFAULT_STPLUG_DIR, g["lua_file"])
             if os.path.exists(src):
                 zf.write(src, f"stplug-in/{g['lua_file']}")
 
-        # Add corresponding manifests if present
         if os.path.exists(manifests_dir):
             for mfile in os.listdir(manifests_dir):
                 m_match = re.match(r"^(\d+)_\d+\.manifest$", mfile)
@@ -182,7 +184,6 @@ def export_games(appids=None, backup_name=None, backup_dir=DEFAULT_BACKUP_DIR):
                     msrc = os.path.join(manifests_dir, mfile)
                     zf.write(msrc, f"manifests/{mfile}")
 
-        # Add library-added-times.txt
         lat = os.path.join(DEFAULT_SLS_DIR, "library-added-times.txt")
         if os.path.exists(lat):
             zf.write(lat, "sls/library-added-times.txt")
@@ -324,386 +325,197 @@ def import_single_file(file_path):
         name = fname
     return {"success": True, "appid": aid, "name": name, "dest": dest}
 
-# Minimal Local Web GUI
-def start_gui_server(port=8342):
-    import http.server
-    import urllib.parse
-    import webbrowser
+# Standalone Steam In-Memory Injector
+def inject_into_steam():
+    port_file = os.path.expanduser("~/.local/share/Lumen/cef_port")
+    port = None
+    if os.path.exists(port_file):
+        try:
+            with open(port_file, "r") as f:
+                port = f.read().split("\n")[0].strip()
+        except Exception:
+            pass
 
-    class RequestHandler(http.server.BaseHTTPRequestHandler):
-        def log_message(self, format, *args):
-            pass # Silent
+    if not port:
+        # Scan ps aux for --remote-debugging-port
+        try:
+            out = subprocess.check_output(["pgrep", "-a", "steamwebhelper"]).decode()
+            m = re.search(r'--remote-debugging-port=(\d+)', out)
+            if m:
+                port = m.group(1)
+        except Exception:
+            pass
 
-        def do_GET(self):
-            parsed = urllib.parse.urlparse(self.path)
-            if parsed.path == "/api/status":
-                games = get_managed_games()
-                backups = list_backups()
-                data = {
-                    "games": games,
-                    "backups": backups,
-                    "total_games": len(games),
-                    "total_backups": len(backups)
-                }
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.end_headers()
-                self.wfile.write(json.dumps(data).encode("utf-8"))
-                return
+    if not port:
+        return False, "Could not locate Steam remote debugging port"
 
-            # Main HTML UI
+    # Inject via Node script
+    node_script = f"""
+    const fs = require('fs');
+    const path = '{REPO_DIR}';
+    const css = fs.readFileSync(path + '/frontend/styles.css', 'utf8');
+    const js = fs.readFileSync(path + '/frontend/index.js', 'utf8');
+
+    async function run() {{
+      const res = await fetch('http://127.0.0.1:{port}/json');
+      const pages = await res.json();
+      const steam = pages.find(p => p.title === 'Steam');
+      if (!steam) return process.exit(1);
+
+      const ws = new WebSocket(steam.webSocketDebuggerUrl);
+      ws.onopen = () => {{
+        const code = `
+          (function() {{
+            if (!document.getElementById('slm-styles')) {{
+              const s = document.createElement('style');
+              s.id = 'slm-styles';
+              s.textContent = ${{JSON.stringify(css)}};
+              document.head.appendChild(s);
+            }}
+            ${{js}}
+            return true;
+          }})()
+        `;
+        ws.send(JSON.stringify({{ id: 1, method: 'Runtime.evaluate', params: {{ expression: code, returnByValue: true }} }}));
+      }};
+      ws.onmessage = () => process.exit(0);
+      ws.onerror = () => process.exit(1);
+    }}
+    run();
+    """
+    try:
+        res = subprocess.run(["node", "-e", node_script], capture_output=True, timeout=5)
+        return res.returncode == 0, "Injected"
+    except Exception as e:
+        return False, str(e)
+
+# HTTP Request Handler with CORS
+class RequestHandler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, format, *args):
+        pass
+
+    def send_cors_headers(self):
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+
+    def do_OPTIONS(self):
+        self.send_response(200)
+        self.send_cors_headers()
+        self.end_headers()
+
+    def do_GET(self):
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path in ["/api/games", "/api/status"]:
+            games = get_managed_games()
+            backups = list_backups()
+            data = {"success": True, "games": games, "backups": backups, "total": len(games)}
             self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_cors_headers()
+            self.send_header("Content-Type", "application/json")
             self.end_headers()
-            html = """<!DOCTYPE html>
+            self.wfile.write(json.dumps(data).encode("utf-8"))
+            return
+
+        elif parsed.path == "/api/backups":
+            backups = list_backups()
+            data = {"success": True, "backups": backups}
+            self.send_response(200)
+            self.send_cors_headers()
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps(data).encode("utf-8"))
+            return
+
+        # Serve Web UI HTML
+        self.send_response(200)
+        self.send_cors_headers()
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.end_headers()
+        # Minimal embedded dashboard
+        html = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <title>Steam Library Manager</title>
 <style>
-  :root {
-    --bg: #171a21;
-    --card: #1e232d;
-    --card-border: #2e3543;
-    --accent: #1a9fff;
-    --accent-hover: #33a9ff;
-    --text: #c7d5e0;
-    --text-bright: #ffffff;
-    --text-muted: #8f98a0;
-    --success: #5c7e10;
-    --success-bright: #a4d007;
-  }
-  body {
-    background: var(--bg);
-    color: var(--text);
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-    margin: 0; padding: 24px;
-  }
-  .container { max-width: 1000px; margin: 0 auto; }
-  h1 { color: var(--text-bright); display: flex; align-items: center; gap: 12px; margin-bottom: 8px; }
-  .subtitle { color: var(--text-muted); margin-bottom: 24px; }
-  .tabs { display: flex; gap: 8px; margin-bottom: 20px; }
-  .tab-btn {
-    background: var(--card); border: 1px solid var(--card-border); color: var(--text);
-    padding: 10px 20px; border-radius: 6px; cursor: pointer; font-weight: 600;
-  }
-  .tab-btn.active { background: var(--accent); color: #fff; border-color: var(--accent); }
-  .panel { display: none; background: var(--card); border: 1px solid var(--card-border); border-radius: 8px; padding: 20px; }
-  .panel.active { display: block; }
-  .action-bar { display: flex; gap: 12px; align-items: center; margin-bottom: 16px; flex-wrap: wrap; }
-  input[type="text"] {
-    background: #12151b; border: 1px solid var(--card-border); color: #fff;
-    padding: 8px 14px; border-radius: 4px; flex: 1; min-width: 200px;
-  }
-  button.primary {
-    background: var(--accent); border: none; color: #fff; padding: 9px 18px; border-radius: 4px;
-    cursor: pointer; font-weight: 600; transition: background 0.15s;
-  }
-  button.primary:hover { background: var(--accent-hover); }
-  button.secondary {
-    background: #2a313d; border: 1px solid var(--card-border); color: #fff;
-    padding: 9px 18px; border-radius: 4px; cursor: pointer; font-weight: 500;
-  }
-  button.secondary:hover { background: #384252; }
-  .game-table { width: 100%; border-collapse: collapse; margin-top: 12px; }
-  .game-table th, .game-table td { padding: 10px 12px; text-align: left; border-bottom: 1px solid #282f3c; }
-  .game-table th { color: var(--text-muted); font-size: 13px; text-transform: uppercase; }
-  .game-table tr:hover { background: rgba(255,255,255,0.02); }
-  .badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 12px; font-weight: 600; }
-  .badge.installed { background: rgba(92,126,16,0.2); color: var(--success-bright); }
-  .badge.library { background: rgba(26,159,255,0.15); color: var(--accent); }
-  .toast {
-    position: fixed; bottom: 24px; right: 24px; background: #222731; border: 1px solid var(--accent);
-    color: #fff; padding: 14px 24px; border-radius: 6px; box-shadow: 0 4px 16px rgba(0,0,0,0.5);
-    display: none; z-index: 1000;
-  }
+  :root {{ --bg: #171a21; --card: #1e232d; --card-border: #2e3543; --accent: #1a9fff; --text: #c7d5e0; }}
+  body {{ background: var(--bg); color: var(--text); font-family: -apple-system, sans-serif; margin: 0; padding: 24px; }}
+  .container {{ max-width: 900px; margin: 0 auto; }}
+  h1 {{ color: #fff; }}
+  button {{ background: var(--accent); border: none; color: #fff; padding: 8px 16px; border-radius: 4px; font-weight: 600; cursor: pointer; }}
 </style>
 </head>
 <body>
 <div class="container">
-  <h1>🎮 Steam Library Manager</h1>
-  <div class="subtitle">Complete Backup & Restore for SLSsteam / LuaTools games (Single, Multi-Select, or All)</div>
-
-  <div class="tabs">
-    <button class="tab-btn active" onclick="switchTab('export')">📦 Export & Backup</button>
-    <button class="tab-btn" onclick="switchTab('restore')">📥 Restore & Import</button>
-  </div>
-
-  <div id="tab-export" class="panel active">
-    <div class="action-bar">
-      <input type="text" id="search-box" placeholder="🔍 Search games..." oninput="filterGames()">
-      <button class="secondary" onclick="toggleSelectAll()">Select All / None</button>
-      <button class="primary" onclick="exportSelected()">💾 Export Selected (<span id="sel-count">0</span>)</button>
-      <button class="primary" style="background:#2874a6" onclick="exportAll()">📦 Backup Whole Library</button>
-    </div>
-
-    <table class="game-table">
-      <thead>
-        <tr>
-          <th width="30"><input type="checkbox" id="th-checkbox" onchange="toggleSelectAll()"></th>
-          <th>Game</th>
-          <th>AppID</th>
-          <th>Status</th>
-          <th width="100">Action</th>
-        </tr>
-      </thead>
-      <tbody id="games-list">
-        <tr><td colspan="5" style="text-align:center;padding:24px;">Loading library...</td></tr>
-      </tbody>
-    </table>
-  </div>
-
-  <div id="tab-restore" class="panel">
-    <div class="action-bar">
-      <h3 style="margin:0;color:#fff;">Available Backups</h3>
-      <button class="secondary" onclick="loadData()">🔄 Refresh</button>
-    </div>
-    <table class="game-table">
-      <thead>
-        <tr>
-          <th>Backup Archive</th>
-          <th>Games</th>
-          <th>Size</th>
-          <th>Created</th>
-          <th width="200">Actions</th>
-        </tr>
-      </thead>
-      <tbody id="backups-list">
-        <tr><td colspan="5" style="text-align:center;padding:24px;">No backups found yet.</td></tr>
-      </tbody>
-    </table>
-  </div>
+  <h1>🎮 Steam Library Manager Dashboard</h1>
+  <p>The manager daemon is running and actively connected to your Steam client.</p>
+  <button onclick="fetch('/api/export', {{method:'POST', body:JSON.stringify({{appids:'all'}})}}).then(()=>alert('Backed up all games!'))">💾 Backup All Games</button>
 </div>
-<div id="toast" class="toast"></div>
-
-<script>
-let state = { games: [], backups: [] };
-
-function showToast(msg) {
-  const t = document.getElementById("toast");
-  t.innerText = msg;
-  t.style.display = "block";
-  setTimeout(() => { t.style.display = "none"; }, 4000);
-}
-
-function switchTab(t) {
-  document.querySelectorAll(".tab-btn").forEach(b => b.classList.remove("active"));
-  document.querySelectorAll(".panel").forEach(p => p.classList.remove("active"));
-  if (t === "export") {
-    document.querySelectorAll(".tab-btn")[0].classList.add("active");
-    document.getElementById("tab-export").classList.add("active");
-  } else {
-    document.querySelectorAll(".tab-btn")[1].classList.add("active");
-    document.getElementById("tab-restore").classList.add("active");
-  }
-}
-
-async function loadData() {
-  const res = await fetch("/api/status");
-  state = await res.json();
-  renderGames();
-  renderBackups();
-}
-
-function renderGames() {
-  const q = document.getElementById("search-box").value.toLowerCase();
-  const tb = document.getElementById("games-list");
-  tb.innerHTML = "";
-  const filtered = state.games.filter(g => g.name.toLowerCase().includes(q) || g.appid.toString().includes(q));
-
-  if (filtered.length === 0) {
-    tb.innerHTML = "<tr><td colspan='5' style='text-align:center;padding:24px;'>No matching games found.</td></tr>";
-    return;
-  }
-
-  filtered.forEach(g => {
-    const tr = document.createElement("tr");
-    tr.innerHTML = `
-      <td><input type="checkbox" class="game-chk" value="${g.appid}" onchange="updateSelCount()"></td>
-      <td style="font-weight:600;color:#fff;">${g.name}</td>
-      <td style="color:#8f98a0;">${g.appid}</td>
-      <td><span class="badge ${g.installed ? 'installed' : 'library'}">${g.installed ? 'Installed' : 'In Library'}</span></td>
-      <td><button class="secondary" style="padding:4px 10px;font-size:12px;" onclick="exportSingle(${g.appid})">Export</button></td>
-    `;
-    tb.appendChild(tr);
-  });
-  updateSelCount();
-}
-
-function filterGames() { renderGames(); }
-
-function updateSelCount() {
-  const count = document.querySelectorAll(".game-chk:checked").length;
-  document.getElementById("sel-count").innerText = count;
-}
-
-function toggleSelectAll() {
-  const chks = document.querySelectorAll(".game-chk");
-  const anyUnchecked = Array.from(chks).some(c => !c.checked);
-  chks.forEach(c => c.checked = anyUnchecked);
-  updateSelCount();
-}
-
-function renderBackups() {
-  const tb = document.getElementById("backups-list");
-  tb.innerHTML = "";
-  if (!state.backups || state.backups.length === 0) {
-    tb.innerHTML = "<tr><td colspan='5' style='text-align:center;padding:24px;'>No backups found in ~/SteamLibrary-Backups.</td></tr>";
-    return;
-  }
-
-  state.backups.forEach(b => {
-    const tr = document.createElement("tr");
-    const dt = new Date(b.mtime * 1000).toLocaleString();
-    const sz = (b.size / 1024).toFixed(1) + " KB";
-    tr.innerHTML = `
-      <td style="font-weight:600;color:#fff;">${b.filename}</td>
-      <td>${b.count} games</td>
-      <td>${sz}</td>
-      <td style="color:#8f98a0;">${dt}</td>
-      <td>
-        <button class="primary" style="padding:4px 10px;font-size:12px;" onclick="restoreBackup('${b.filename}', 'all')">Restore All</button>
-        <button class="secondary" style="padding:4px 10px;font-size:12px;margin-left:6px;" onclick="restoreSelectivePrompt('${b.filename}')">Selective</button>
-      </td>
-    `;
-    tb.appendChild(tr);
-  });
-}
-
-async function exportSingle(aid) {
-  const res = await fetch("/api/export", {
-    method: "POST",
-    headers: {"Content-Type": "application/json"},
-    body: JSON.stringify({ appids: [aid] })
-  });
-  const data = await res.json();
-  if (data.success) {
-    showToast(`✓ Exported ${data.count} game to ${data.backup_name}`);
-    loadData();
-  } else {
-    alert("Export failed: " + data.error);
-  }
-}
-
-async function exportSelected() {
-  const sel = Array.from(document.querySelectorAll(".game-chk:checked")).map(c => parseInt(c.value));
-  if (sel.length === 0) {
-    alert("Please select at least one game.");
-    return;
-  }
-  const res = await fetch("/api/export", {
-    method: "POST",
-    headers: {"Content-Type": "application/json"},
-    body: JSON.stringify({ appids: sel })
-  });
-  const data = await res.json();
-  if (data.success) {
-    showToast(`✓ Exported ${data.count} selected games to ${data.backup_name}`);
-    loadData();
-  } else {
-    alert("Export failed: " + data.error);
-  }
-}
-
-async function exportAll() {
-  const res = await fetch("/api/export", {
-    method: "POST",
-    headers: {"Content-Type": "application/json"},
-    body: JSON.stringify({ appids: "all" })
-  });
-  const data = await res.json();
-  if (data.success) {
-    showToast(`✓ Backed up whole library (${data.count} games) to ${data.backup_name}`);
-    loadData();
-  } else {
-    alert("Export failed: " + data.error);
-  }
-}
-
-async function restoreBackup(filename, mode, appids=null) {
-  const req = { backup_filename: filename, appids: appids || "all" };
-  const res = await fetch("/api/restore", {
-    method: "POST",
-    headers: {"Content-Type": "application/json"},
-    body: JSON.stringify(req)
-  });
-  const data = await res.json();
-  if (data.success) {
-    showToast(`✓ Restored ${data.restored_count} games! Restart Steam to refresh.`);
-    loadData();
-  } else {
-    alert("Restore failed: " + data.error);
-  }
-}
-
-function restoreSelectivePrompt(filename) {
-  const b = state.backups.find(x => x.filename === filename);
-  if (!b || !b.games || b.games.length === 0) {
-    alert("No game metadata found in archive.");
-    return;
-  }
-  const listStr = b.games.map((g, idx) => `${idx + 1}. [AppID: ${g.appid}] ${g.name}`).join("\\n");
-  const choice = prompt("Enter AppIDs to restore separated by commas (or leave blank to restore all):\\n\\n" + listStr);
-  if (choice === null) return;
-  if (choice.trim() === "") {
-    restoreBackup(filename, "all");
-  } else {
-    const aids = choice.split(",").map(s => parseInt(s.trim())).filter(n => !isNaN(n));
-    if (aids.length > 0) {
-      restoreBackup(filename, "selective", aids);
-    }
-  }
-}
-
-window.onload = loadData;
-</script>
 </body>
 </html>"""
-            self.wfile.write(html.encode("utf-8"))
+        self.wfile.write(html.encode("utf-8"))
 
-        def do_POST(self):
-            parsed = urllib.parse.urlparse(self.path)
-            length = int(self.headers.get('Content-Length', 0))
-            body = self.rfile.read(length).decode('utf-8')
-            try:
-                payload = json.loads(body) if body else {}
-            except Exception:
-                payload = {}
+    def do_POST(self):
+        parsed = urllib.parse.urlparse(self.path)
+        length = int(self.headers.get('Content-Length', 0))
+        body = self.rfile.read(length).decode('utf-8')
+        try:
+            payload = json.loads(body) if body else {}
+        except Exception:
+            payload = {}
 
-            if parsed.path == "/api/export":
-                appids = payload.get("appids")
-                name = payload.get("backup_name")
-                result = export_games(appids=appids, backup_name=name)
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.end_headers()
-                self.wfile.write(json.dumps(result).encode("utf-8"))
+        if parsed.path in ["/api/games", "/api/get_games"]:
+            result = {"success": True, "games": get_managed_games()}
+        elif parsed.path in ["/api/backups", "/api/get_backups"]:
+            result = {"success": True, "backups": list_backups()}
+        elif parsed.path in ["/api/export", "/api/export_games"]:
+            appids = payload.get("appids")
+            name = payload.get("backup_name") or payload.get("name")
+            result = export_games(appids=appids, backup_name=name)
+        elif parsed.path in ["/api/restore", "/api/restore_games"]:
+            filename = payload.get("backup_filename")
+            bpath = payload.get("backup_path") or (os.path.join(DEFAULT_BACKUP_DIR, filename) if filename else None)
+            appids = payload.get("appids")
+            result = restore_games(backup_path=bpath, appids=appids)
+        elif parsed.path == "/api/inject":
+            ok, msg = inject_into_steam()
+            result = {"success": ok, "message": msg}
+        else:
+            self.send_response(404)
+            self.end_headers()
+            return
 
-            elif parsed.path == "/api/restore":
-                filename = payload.get("backup_filename")
-                bpath = os.path.join(DEFAULT_BACKUP_DIR, filename) if filename else None
-                appids = payload.get("appids")
-                result = restore_games(backup_path=bpath, appids=appids)
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.end_headers()
-                self.wfile.write(json.dumps(result).encode("utf-8"))
-            else:
-                self.send_response(404)
-                self.end_headers()
+        self.send_response(200)
+        self.send_cors_headers()
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(json.dumps(result).encode("utf-8"))
 
+def run_server(port=8343):
     server = http.server.HTTPServer(("127.0.0.1", port), RequestHandler)
-    url = f"http://127.0.0.1:{port}"
-    print(f"\n🚀 Steam Library Manager GUI is running at: {url}")
-    print("Press Ctrl+C to close.")
-    try:
-        webbrowser.open(url)
-    except Exception:
-        pass
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        print("\nGUI Server stopped.")
+    server.serve_forever()
+
+def run_daemon(port=8343):
+    print(f"[SLM Daemon] Starting background API service on 127.0.0.1:{port}...")
+    t = threading.Thread(target=run_server, args=(port,), daemon=True)
+    t.start()
+
+    # Watcher loop: auto-inject into Steam when Steam is detected
+    last_injected = 0
+    while True:
+        try:
+            time.sleep(3)
+            # Try injection every 5s if needed
+            now = time.time()
+            if now - last_injected > 5:
+                ok, _ = inject_into_steam()
+                if ok:
+                    last_injected = now
+        except KeyboardInterrupt:
+            break
+        except Exception:
+            pass
 
 def main():
     parser = argparse.ArgumentParser(description="Steam Library Manager - Backup and Restore SLSsteam/LuaTools games")
@@ -730,6 +542,12 @@ def main():
     p_restore.add_argument("--games", type=str, help="Comma-separated AppIDs to restore")
     p_restore.add_argument("--game", type=int, help="Single AppID to restore")
     p_restore.add_argument("--file", type=str, help="Import a single .lua file directly")
+
+    # inject
+    subparsers.add_parser("inject", help="Inject button & UI into currently running Steam client")
+
+    # daemon
+    subparsers.add_parser("daemon", help="Run background API daemon & auto-injector")
 
     # gui
     subparsers.add_parser("gui", help="Open local web GUI in browser")
@@ -810,8 +628,18 @@ def main():
         else:
             print(f"\n✗ Restore failed: {res['error']}")
 
+    elif args.command == "inject":
+        ok, msg = inject_into_steam()
+        if ok:
+            print("[✓] Successfully injected Library Manager into running Steam client!")
+        else:
+            print(f"[✗] Injection failed: {msg}")
+
+    elif args.command == "daemon":
+        run_daemon()
+
     elif args.command == "gui":
-        start_gui_server()
+        run_daemon()
 
 if __name__ == "__main__":
     main()
