@@ -2,6 +2,8 @@
 """
 Steam Library Manager
 Universal Steam game metadata backup & restore (Purchased, Installed, & LuaTools/SLSsteam unlocked).
+100% Dynamic Game Title Detection directly from the user's Steam client.
+Zero hardcoded games.
 """
 
 import os
@@ -24,23 +26,8 @@ DEFAULT_STEAM_ROOT = os.path.expanduser("~/.local/share/Steam")
 DEFAULT_STPLUG_DIR = os.path.join(DEFAULT_STEAM_ROOT, "config/stplug-in")
 DEFAULT_SLS_DIR = os.path.expanduser("~/.config/SLSsteam")
 DEFAULT_BACKUP_DIR = os.path.expanduser("~/SteamLibrary-Backups")
+NAMES_CACHE_FILE = os.path.expanduser("~/.config/steam-library-manager/names_cache.json")
 REPO_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-
-KNOWN_NAMES = {
-    730: "Counter-Strike 2", 204100: "Max Payne 3", 292030: "The Witcher 3: Wild Hunt",
-    391220: "Rise of the Tomb Raider", 447040: "Watch_Dogs 2", 552520: "Far Cry 5",
-    582160: "Assassin's Creed Origins", 814380: "Sekiro™: Shadows Die Twice",
-    870780: "Control Ultimate Edition", 934700: "Cricket 22", 1028630: "Cricket 19",
-    1030840: "Mafia: Definitive Edition", 1116960: "UNDEFEATED", 1174180: "Red Dead Redemption 2",
-    1196590: "Resident Evil Village", 1238860: "Battlefield 4™", 1259420: "Days Gone",
-    1338770: "Sniper Ghost Warrior Contracts 2", 1364780: "Street Fighter™ 6",
-    1504980: "It Takes Two Friend's Pass", 1593500: "God of War", 1627720: "Lies of P",
-    1659040: "HITMAN World of Assassination", 1659420: "UNCHARTED™: Legacy of Thieves Collection",
-    1815780: "Asphalt Legends", 1817190: "Marvel's Spider-Man: Miles Morales",
-    1888930: "The Last of Us™ Part I", 2215430: "Ghost of Tsushima DIRECTOR'S CUT",
-    2358720: "Black Myth: Wukong", 3240220: "Grand Theft Auto V Enhanced",
-    3468650: "Cricket 26 - The Official Game of the Ashes"
-}
 
 def get_steam_libraries():
     roots = [DEFAULT_STEAM_ROOT]
@@ -57,11 +44,132 @@ def get_steam_libraries():
             pass
     return roots
 
+def load_names_cache():
+    if os.path.exists(NAMES_CACHE_FILE):
+        try:
+            with open(NAMES_CACHE_FILE, "r", encoding="utf-8") as f:
+                return {int(k): v for k, v in json.load(f).items()}
+        except Exception:
+            pass
+    return {}
+
+def save_names_cache(cache):
+    os.makedirs(os.path.dirname(NAMES_CACHE_FILE), exist_ok=True)
+    try:
+        with open(NAMES_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump({str(k): v for k, v in cache.items()}, f, indent=2)
+    except Exception:
+        pass
+
+def fetch_live_names_from_steam():
+    names = {}
+    port_file = os.path.expanduser("~/.local/share/Lumen/cef_port")
+    port = None
+    if os.path.exists(port_file):
+        try:
+            with open(port_file, "r") as f:
+                port = f.read().split("\n")[0].strip()
+        except Exception:
+            pass
+    if not port:
+        try:
+            out = subprocess.check_output(["pgrep", "-a", "steamwebhelper"]).decode()
+            m = re.search(r'--remote-debugging-port=(\d+)', out)
+            if m:
+                port = m.group(1)
+        except Exception:
+            pass
+    if not port:
+        return names
+
+    node_code = f"""
+    const fs = require('fs');
+    async function run() {{
+        try {{
+            const res = await fetch('http://127.0.0.1:{port}/json');
+            const pages = await res.json();
+            const shared = pages.find(p => p.title === 'SharedJSContext');
+            if (!shared) return process.exit(1);
+            const ws = new WebSocket(shared.webSocketDebuggerUrl);
+            ws.onopen = () => {{
+                ws.send(JSON.stringify({{
+                    id: 1,
+                    method: 'Runtime.evaluate',
+                    params: {{
+                        expression: `
+                            (function() {{
+                                const games = {{}};
+                                if (window.appStore && window.appStore.m_mapApps) {{
+                                    for (const [aid, app] of window.appStore.m_mapApps) {{
+                                        if (app.app_type === 1 && app.display_name) {{
+                                            games[aid] = app.display_name;
+                                        }}
+                                    }}
+                                }}
+                                return games;
+                            }})()
+                        `,
+                        returnByValue: true
+                    }}
+                }}));
+            }};
+            ws.onmessage = (e) => {{
+                const val = JSON.parse(e.data).result.result.value;
+                console.log(JSON.stringify(val));
+                process.exit(0);
+            }};
+            ws.onerror = () => process.exit(1);
+        }} catch(e) {{
+            process.exit(1);
+        }}
+    }}
+    run();
+    """
+    try:
+        out = subprocess.run(["node", "-e", node_code], capture_output=True, text=True, timeout=2)
+        if out.returncode == 0 and out.stdout.strip():
+            data = json.loads(out.stdout.strip())
+            for k, v in data.items():
+                if v and str(v).strip():
+                    names[int(k)] = v
+    except Exception:
+        pass
+    return names
+
+def resolve_all_dynamic_names():
+    names = load_names_cache()
+
+    # 1. Fetch live game titles directly from running Steam client (app_type === 1)
+    live = fetch_live_names_from_steam()
+    if live:
+        names.update(live)
+
+    # 2. Scan ACF manifests on disk in all Steam library folders
+    roots = get_steam_libraries()
+    for r in set(roots):
+        for acf in glob.glob(os.path.join(r, "steamapps/appmanifest_*.acf")):
+            try:
+                with open(acf, "r", encoding="utf-8", errors="ignore") as f:
+                    txt = f.read()
+                aid = re.search(r'"appid"\s+"(\d+)"', txt)
+                mname = re.search(r'"name"\s+"([^"]+)"', txt)
+                if aid and mname:
+                    a = int(aid.group(1))
+                    if a not in [228980, 1493710, 4183110]:
+                        if a not in names:
+                            names[a] = mname.group(1)
+            except Exception:
+                pass
+
+    save_names_cache(names)
+    return names
+
 def get_all_library_games():
-    names = dict(KNOWN_NAMES)
+    names = resolve_all_dynamic_names()
     games_map = {}
     roots = get_steam_libraries()
 
+    # 1. Scan physical installations
     for r in set(roots):
         for acf in glob.glob(os.path.join(r, "steamapps/appmanifest_*.acf")):
             try:
@@ -77,10 +185,11 @@ def get_all_library_games():
                     a = int(aid.group(1))
                     if a in [228980, 1493710, 4183110]:
                         continue
-                    names[a] = name.group(1)
+                    display_name = names.get(a, name.group(1))
+                    names[a] = display_name
                     games_map[a] = {
                         "appid": a,
-                        "name": name.group(1),
+                        "name": display_name,
                         "installed": True,
                         "installdir": inst_dir.group(1) if inst_dir else "",
                         "size_on_disk": int(sz.group(1)) if sz else 0,
@@ -94,6 +203,7 @@ def get_all_library_games():
             except Exception:
                 pass
 
+    # 2. Scan stplug-in for LuaTools manifests
     if os.path.exists(DEFAULT_STPLUG_DIR):
         for f in os.listdir(DEFAULT_STPLUG_DIR):
             if not f.endswith(".lua"):
@@ -131,6 +241,7 @@ def get_all_library_games():
                 games_map[a]["depots"] = depots
                 games_map[a]["source"] = "Official / LuaTools"
 
+    # 3. Add known account games dynamically discovered from user's Steam client
     for a, gname in names.items():
         if a not in games_map and a not in [228980, 1493710, 4183110]:
             games_map[a] = {
@@ -143,7 +254,7 @@ def get_all_library_games():
                 "source": "Official Steam Account"
             }
 
-    return [games_map[k] for k in sorted(games_map.keys(), key=lambda x: games_map[x]["name"].lower())]
+    return [games_map[k] for k in sorted(games_map.keys(), key=lambda x: str(games_map[x]["name"]).lower())]
 
 def export_games(appids=None, backup_name=None, backup_dir=DEFAULT_BACKUP_DIR):
     all_games = get_all_library_games()
@@ -163,7 +274,7 @@ def export_games(appids=None, backup_name=None, backup_dir=DEFAULT_BACKUP_DIR):
     ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     if not backup_name:
         if len(selected_games) == 1:
-            clean_name = re.sub(r'[^a-zA-Z0-9_\-]', '_', selected_games[0]["name"])
+            clean_name = re.sub(r'[^a-zA-Z0-9_\-]', '_', str(selected_games[0]["name"]))
             backup_name = f"game_{selected_games[0]['appid']}_{clean_name}_{ts}.zip"
         elif len(selected_games) == len(all_games):
             backup_name = f"steam_library_full_{ts}.zip"
@@ -239,6 +350,7 @@ def export_games(appids=None, backup_name=None, backup_dir=DEFAULT_BACKUP_DIR):
 def list_backups(backup_dir=DEFAULT_BACKUP_DIR):
     if not os.path.exists(backup_dir):
         return []
+    names = resolve_all_dynamic_names()
     backups = []
     for f in sorted(os.listdir(backup_dir), reverse=True):
         if not f.endswith(".zip"):
@@ -256,10 +368,10 @@ def list_backups(backup_dir=DEFAULT_BACKUP_DIR):
                     for n in zf.namelist():
                         if n.startswith("stplug-in/") and n.endswith(".lua"):
                             aid = int(n[10:-4])
-                            games_list.append({"appid": aid, "name": KNOWN_NAMES.get(aid, f"AppID {aid}")})
+                            games_list.append({"appid": aid, "name": names.get(aid, f"AppID {aid}")})
                         elif n.startswith("acfs/appmanifest_") and n.endswith(".acf"):
                             aid = int(n[17:-4])
-                            games_list.append({"appid": aid, "name": KNOWN_NAMES.get(aid, f"AppID {aid}")})
+                            games_list.append({"appid": aid, "name": names.get(aid, f"AppID {aid}")})
         except Exception:
             pass
 
@@ -296,6 +408,7 @@ def restore_games(backup_path=None, appids=None, backup_dir=DEFAULT_BACKUP_DIR):
     if not os.path.exists(backup_path):
         return {"success": False, "error": f"Backup file not found: {backup_path}"}
 
+    names = resolve_all_dynamic_names()
     os.makedirs(DEFAULT_STPLUG_DIR, exist_ok=True)
     manifests_dir = os.path.join(DEFAULT_SLS_DIR, "manifests")
     os.makedirs(manifests_dir, exist_ok=True)
@@ -333,7 +446,7 @@ def restore_games(backup_path=None, appids=None, backup_dir=DEFAULT_BACKUP_DIR):
                 with open(dest, "wb") as f:
                     f.write(zf.read(member))
 
-                g_info = avail_map.get(aid, {"appid": aid, "name": KNOWN_NAMES.get(aid, f"AppID {aid}")})
+                g_info = avail_map.get(aid, {"appid": aid, "name": names.get(aid, f"AppID {aid}")})
                 if g_info not in restored:
                     restored.append(g_info)
 
@@ -355,7 +468,7 @@ def restore_games(backup_path=None, appids=None, backup_dir=DEFAULT_BACKUP_DIR):
                     with open(dest, "wb") as f:
                         f.write(zf.read(member))
 
-                    g_info = avail_map.get(aid, {"appid": aid, "name": KNOWN_NAMES.get(aid, f"AppID {aid}")})
+                    g_info = avail_map.get(aid, {"appid": aid, "name": names.get(aid, f"AppID {aid}")})
                     if g_info not in restored:
                         restored.append(g_info)
 
@@ -382,6 +495,7 @@ def import_single_file(file_path):
     if not os.path.exists(file_path):
         return {"success": False, "error": f"File not found: {file_path}"}
 
+    names = resolve_all_dynamic_names()
     fname = os.path.basename(file_path)
     if fname.endswith(".lua"):
         dest = os.path.join(DEFAULT_STPLUG_DIR, fname)
@@ -389,7 +503,7 @@ def import_single_file(file_path):
         shutil.copy2(file_path, dest)
         try:
             aid = int(fname[:-4])
-            name = KNOWN_NAMES.get(aid, f"AppID {aid}")
+            name = names.get(aid, f"AppID {aid}")
         except Exception:
             aid, name = 0, fname
         return {"success": True, "appid": aid, "name": name, "dest": dest, "type": "Lua Manifest"}
@@ -400,7 +514,7 @@ def import_single_file(file_path):
         shutil.copy2(file_path, dest)
         aid_m = re.search(r"appmanifest_(\d+)\.acf", fname)
         aid = int(aid_m.group(1)) if aid_m else 0
-        name = KNOWN_NAMES.get(aid, f"AppID {aid}")
+        name = names.get(aid, f"AppID {aid}")
         return {"success": True, "appid": aid, "name": name, "dest": dest, "type": "Steam App Manifest"}
 
     return {"success": False, "error": "Only .lua manifest scripts or appmanifest_*.acf files can be imported"}
@@ -522,7 +636,7 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
 </head>
 <body>
   <h1>🎮 Steam Library Manager</h1>
-  <p>Universal backup daemon for all Steam games is running.</p>
+  <p>Universal backup daemon for all Steam games is running (100% dynamic title detection directly from Steam client).</p>
   <button onclick="fetch('/api/export', {{method:'POST', body:JSON.stringify({{appids:'all'}})}}).then(()=>alert('Backed up all games!'))">💾 Backup Whole Library</button>
 </body>
 </html>"""
@@ -572,7 +686,7 @@ def run_server(port=8343):
     server.serve_forever()
 
 def run_daemon(port=8343):
-    print(f"[SLM Daemon] Starting universal API service on 127.0.0.1:{port}...")
+    print(f"[SLM Daemon] Starting dynamic API service on 127.0.0.1:{port}...")
     t = threading.Thread(target=run_server, args=(port,), daemon=True)
     t.start()
 
@@ -591,28 +705,23 @@ def run_daemon(port=8343):
             pass
 
 def main():
-    parser = argparse.ArgumentParser(description="Steam Library Manager - Backup and Restore all Steam games")
+    parser = argparse.ArgumentParser(description="Steam Library Manager - Backup and Restore all Steam games (Dynamic)")
     subparsers = parser.add_subparsers(dest="command")
 
-    # list
     subparsers.add_parser("list", help="List all Steam games in library")
 
-    # export
     p_export = subparsers.add_parser("export", help="Export/backup games metadata")
     p_export.add_argument("--all", action="store_true", help="Export whole library")
-    p_export.add_argument("--games", type=str, help="Comma-separated AppIDs to export (e.g. 1174180,814380)")
+    p_export.add_argument("--games", type=str, help="Comma-separated AppIDs to export")
     p_export.add_argument("--game", type=int, help="Single AppID to export")
     p_export.add_argument("--name", type=str, help="Custom backup file name")
     p_export.add_argument("--out", type=str, default=DEFAULT_BACKUP_DIR, help="Backup output directory")
 
-    # backups
     subparsers.add_parser("backups", help="List all available backups")
 
-    # delete
     p_del = subparsers.add_parser("delete", help="Delete a backup file")
     p_del.add_argument("filename", help="Backup filename to delete")
 
-    # restore
     p_restore = subparsers.add_parser("restore", help="Restore games from backup")
     p_restore.add_argument("--backup", type=str, help="Path or filename of backup archive")
     p_restore.add_argument("--all", action="store_true", help="Restore all games from the backup")
@@ -620,20 +729,15 @@ def main():
     p_restore.add_argument("--game", type=int, help="Single AppID to restore")
     p_restore.add_argument("--file", type=str, help="Import a single .lua or appmanifest_*.acf file directly")
 
-    # inject
     subparsers.add_parser("inject", help="Inject floating button & UI into running Steam")
-
-    # daemon
     subparsers.add_parser("daemon", help="Run background universal daemon & auto-injector")
-
-    # gui
     subparsers.add_parser("gui", help="Open local web GUI in browser")
 
     args = parser.parse_args()
 
     if not args.command or args.command == "list":
         games = get_all_library_games()
-        print(f"\n🎮 Universal Steam Games Library ({len(games)} total):")
+        print(f"\n🎮 Universal Steam Games Library ({len(games)} total, 100% dynamic):")
         print("─" * 80)
         for g in games:
             st = "INSTALLED" if g["installed"] else "IN LIBRARY"
