@@ -18,7 +18,8 @@
       "get_games": "/api/games",
       "get_backups": "/api/backups",
       "export": "/api/export",
-      "restore": "/api/restore"
+      "restore": "/api/restore",
+      "delete_backup": "/api/delete_backup"
     };
     const endpoint = endpointMap[method] || `/api/${method}`;
     const res = await fetch(`${BACKEND_URL}${endpoint}`, {
@@ -78,12 +79,12 @@
     header.querySelector(".slm-header-close").addEventListener("click", () => overlay.remove());
     win.appendChild(header);
 
-    // Tab Bar
+    // Tab Bar (Clean "Backup" and "Restore" labels)
     const tabs = document.createElement("div");
     tabs.className = "slm-tabs";
     tabs.innerHTML = `
-      <button class="slm-tab-btn active" data-tab="export">📦 Export & Backup</button>
-      <button class="slm-tab-btn" data-tab="restore">📥 Restore & Import</button>
+      <button class="slm-tab-btn active" data-tab="export">📦 Backup</button>
+      <button class="slm-tab-btn" data-tab="restore">📥 Restore</button>
     `;
     win.appendChild(tabs);
 
@@ -128,7 +129,7 @@
       else renderRestoreTab();
     }
 
-    // ── Export Tab ─────────────────────────────────────────────────────────────
+    // ── Backup Tab ─────────────────────────────────────────────────────────────
     function renderExportTab() {
       const totalCount = state.games.length;
       const instCount = state.games.filter(g => g.installed).length;
@@ -146,7 +147,7 @@
         <div class="slm-toolbar">
           <input type="text" id="slm-search" class="slm-input" placeholder="🔍 Search games, AppID, or source...">
           <button class="slm-btn-secondary" id="slm-toggle-all">Select All / None</button>
-          <button class="slm-btn-primary" id="slm-export-selected">💾 Export Selected (<span id="slm-sel-count">0</span>)</button>
+          <button class="slm-btn-primary" id="slm-export-selected">💾 Backup Selected (<span id="slm-sel-count">0</span>)</button>
           <button class="slm-btn-primary" style="background:#2874a6;" id="slm-export-all">📦 Backup Whole Library</button>
         </div>
 
@@ -224,14 +225,14 @@
             <td style="color:#8f98a0;">${g.appid}</td>
             <td><span class="slm-badge ${srcClass}">${g.source}</span></td>
             <td>${statusBadge}</td>
-            <td><button class="slm-btn-secondary" style="padding:4px 10px;font-size:11px;" data-appid="${g.appid}">Export</button></td>
+            <td><button class="slm-btn-secondary" style="padding:4px 10px;font-size:11px;" data-appid="${g.appid}">Backup</button></td>
           `;
 
           tr.querySelector(".slm-gchk").addEventListener("change", updateSelCount);
           tr.querySelector("button").addEventListener("click", async () => {
             const res = await apiCall("export", { appids: [g.appid] });
             if (res.success) {
-              showToast(`✓ Exported ${g.name} (${g.appid})`);
+              showToast(`✓ Backed up ${g.name} (${g.appid})`);
               loadData();
             }
           });
@@ -258,17 +259,17 @@
       btnExportSel.addEventListener("click", async () => {
         const selected = Array.from(tbody.querySelectorAll(".slm-gchk:checked")).map(c => parseInt(c.value));
         if (selected.length === 0) {
-          alert("Please select at least one game to export.");
+          alert("Please select at least one game to backup.");
           return;
         }
         btnExportSel.disabled = true;
         const res = await apiCall("export", { appids: selected });
         btnExportSel.disabled = false;
         if (res.success) {
-          showToast(`✓ Exported ${res.count} selected games to ${res.backup_name}`);
+          showToast(`✓ Backed up ${res.count} selected games to ${res.backup_name}`);
           loadData();
         } else {
-          alert("Export failed: " + res.error);
+          alert("Backup failed: " + res.error);
         }
       });
 
@@ -280,7 +281,7 @@
           showToast(`✓ Backed up whole library (${res.count} games) to ${res.backup_name}`);
           loadData();
         } else {
-          alert("Export failed: " + res.error);
+          alert("Backup failed: " + res.error);
         }
       });
 
@@ -302,7 +303,7 @@
               <th>Games</th>
               <th>Size</th>
               <th>Created</th>
-              <th width="200">Actions</th>
+              <th width="240">Actions</th>
             </tr>
           </thead>
           <tbody id="slm-backups-body"></tbody>
@@ -329,7 +330,8 @@
           <td style="color:#8f98a0;">${dt}</td>
           <td>
             <button class="slm-btn-primary" style="padding:4px 10px;font-size:11px;" data-action="all">Restore All</button>
-            <button class="slm-btn-secondary" style="padding:4px 10px;font-size:11px;margin-left:6px;" data-action="sel">Selective</button>
+            <button class="slm-btn-secondary" style="padding:4px 10px;font-size:11px;margin-left:4px;" data-action="sel">Selective</button>
+            <button class="slm-btn-danger" style="padding:4px 8px;font-size:11px;margin-left:4px;" data-action="del" title="Delete backup archive">🗑 Delete</button>
           </td>
         `;
 
@@ -357,6 +359,17 @@
             loadData();
           } else {
             alert("Restore failed: " + res.error);
+          }
+        });
+
+        tr.querySelector("[data-action='del']").addEventListener("click", async () => {
+          if (!confirm(`Permanently delete backup archive:\n\n${b.filename}?`)) return;
+          const res = await apiCall("delete_backup", { filename: b.filename });
+          if (res.success) {
+            showToast(`✓ Deleted backup: ${b.filename}`);
+            loadData();
+          } else {
+            alert("Delete failed: " + (res.error || "Unknown error"));
           }
         });
 

@@ -100,7 +100,7 @@
 
 .slm-tabs {
   display: flex;
-  gap: 4px;
+  gap: 6px;
   padding: 10px 20px;
   background: #14161c;
   border-bottom: 1px solid #252b36;
@@ -111,7 +111,7 @@
   color: #8f98a0;
   font-size: 13px;
   font-weight: 600;
-  padding: 8px 16px;
+  padding: 8px 18px;
   border-radius: 4px;
   cursor: pointer;
   transition: all 0.15s;
@@ -197,6 +197,22 @@
 .slm-btn-secondary:hover {
   background: #323b49;
   color: #ffffff;
+}
+.slm-btn-danger {
+  background: rgba(236, 92, 92, 0.12);
+  border: 1px solid rgba(236, 92, 92, 0.35);
+  color: #f28b82;
+  padding: 4px 10px;
+  border-radius: 4px;
+  font-size: 11px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+.slm-btn-danger:hover {
+  background: #ec5c5c;
+  color: #ffffff;
+  border-color: #ec5c5c;
 }
 
 .slm-table {

@@ -62,12 +62,11 @@ def get_all_library_games():
     games_map = {}
     roots = get_steam_libraries()
 
-    # 1. Scan ACF manifests across all Steam library folders (physical installations)
     for r in set(roots):
         for acf in glob.glob(os.path.join(r, "steamapps/appmanifest_*.acf")):
             try:
-                with open(acf, "r", encoding="utf-8", errors="ignore") as f:
-                    txt = f.read()
+                with open(acf, "r", encoding="utf-8", errors="ignore") as txt_f:
+                    txt = txt_f.read()
                 aid = re.search(r'"appid"\s+"(\d+)"', txt)
                 name = re.search(r'"name"\s+"([^"]+)"', txt)
                 inst_dir = re.search(r'"installdir"\s+"([^"]+)"', txt)
@@ -76,7 +75,6 @@ def get_all_library_games():
 
                 if aid and name:
                     a = int(aid.group(1))
-                    # Skip common runtime redistributables
                     if a in [228980, 1493710, 4183110]:
                         continue
                     names[a] = name.group(1)
@@ -96,7 +94,6 @@ def get_all_library_games():
             except Exception:
                 pass
 
-    # 2. Scan stplug-in for LuaTools manifests
     if os.path.exists(DEFAULT_STPLUG_DIR):
         for f in os.listdir(DEFAULT_STPLUG_DIR):
             if not f.endswith(".lua"):
@@ -134,7 +131,6 @@ def get_all_library_games():
                 games_map[a]["depots"] = depots
                 games_map[a]["source"] = "Official / LuaTools"
 
-    # 3. Add known account games
     for a, gname in names.items():
         if a not in games_map and a not in [228980, 1493710, 4183110]:
             games_map[a] = {
@@ -195,19 +191,16 @@ def export_games(appids=None, backup_name=None, backup_dir=DEFAULT_BACKUP_DIR):
         zf.writestr("metadata.json", json.dumps(metadata, indent=2))
 
         for g in selected_games:
-            # 1. Back up Lua manifest if present
             if g.get("has_lua") and g.get("lua_file"):
                 src = os.path.join(DEFAULT_STPLUG_DIR, g["lua_file"])
                 if os.path.exists(src):
                     zf.write(src, f"stplug-in/{g['lua_file']}")
 
-            # 2. Back up ACF manifest for installed / official games
             if g.get("has_acf") and g.get("acf_path"):
                 if os.path.exists(g["acf_path"]):
                     fname = os.path.basename(g["acf_path"])
                     zf.write(g["acf_path"], f"acfs/{fname}")
 
-        # 3. Back up depot manifests for SLSsteam games
         if os.path.exists(manifests_dir) and all_depots:
             for mfile in os.listdir(manifests_dir):
                 m_match = re.match(r"^(\d+)_\d+\.manifest$", mfile)
@@ -215,7 +208,6 @@ def export_games(appids=None, backup_name=None, backup_dir=DEFAULT_BACKUP_DIR):
                     msrc = os.path.join(manifests_dir, mfile)
                     zf.write(msrc, f"manifests/{mfile}")
 
-        # 4. Back up SLS timestamps if available
         lat = os.path.join(DEFAULT_SLS_DIR, "library-added-times.txt")
         if os.path.exists(lat):
             zf.write(lat, "sls/library-added-times.txt")
@@ -281,6 +273,19 @@ def list_backups(backup_dir=DEFAULT_BACKUP_DIR):
         })
     return backups
 
+def delete_backup(filename_or_path, backup_dir=DEFAULT_BACKUP_DIR):
+    if not filename_or_path:
+        return {"success": False, "error": "No filename specified"}
+    fname = os.path.basename(filename_or_path)
+    target = os.path.join(backup_dir, fname)
+    if not os.path.exists(target):
+        return {"success": False, "error": f"Backup file not found: {fname}"}
+    try:
+        os.remove(target)
+        return {"success": True, "filename": fname}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
 def restore_games(backup_path=None, appids=None, backup_dir=DEFAULT_BACKUP_DIR):
     if not backup_path:
         all_b = list_backups(backup_dir)
@@ -314,7 +319,6 @@ def restore_games(backup_path=None, appids=None, backup_dir=DEFAULT_BACKUP_DIR):
         if appids is not None and appids != "all":
             target_appids = set(int(a) for a in appids)
 
-        # 1. Restore .lua manifests
         for member in namelist:
             if member.startswith("stplug-in/") and member.endswith(".lua"):
                 fname = os.path.basename(member)
@@ -333,7 +337,6 @@ def restore_games(backup_path=None, appids=None, backup_dir=DEFAULT_BACKUP_DIR):
                 if g_info not in restored:
                     restored.append(g_info)
 
-            # 2. Restore ACF manifests for official/installed games
             elif member.startswith("acfs/") and member.endswith(".acf"):
                 fname = os.path.basename(member)
                 aid_match = re.search(r"appmanifest_(\d+)\.acf", fname)
@@ -342,7 +345,6 @@ def restore_games(backup_path=None, appids=None, backup_dir=DEFAULT_BACKUP_DIR):
                     if target_appids is not None and aid not in target_appids:
                         continue
 
-                    # Place in default steamapps (or target library path if known)
                     target_lib = steamapps_dir
                     if aid in avail_map and avail_map[aid].get("library_path"):
                         lib_p = avail_map[aid]["library_path"]
@@ -357,14 +359,12 @@ def restore_games(backup_path=None, appids=None, backup_dir=DEFAULT_BACKUP_DIR):
                     if g_info not in restored:
                         restored.append(g_info)
 
-            # 3. Restore SLS manifests
             elif member.startswith("manifests/") and member.endswith(".manifest"):
                 fname = os.path.basename(member)
                 dest = os.path.join(manifests_dir, fname)
                 with open(dest, "wb") as f:
                     f.write(zf.read(member))
 
-            # 4. Restore timestamps
             elif member == "sls/library-added-times.txt":
                 dest = os.path.join(DEFAULT_SLS_DIR, "library-added-times.txt")
                 if not os.path.exists(dest):
@@ -505,7 +505,6 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(json.dumps(data).encode("utf-8"))
             return
 
-        # Serve minimal dashboard
         self.send_response(200)
         self.send_cors_headers()
         self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -523,7 +522,7 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
 </head>
 <body>
   <h1>🎮 Steam Library Manager</h1>
-  <p>Universal backup daemon for all Steam games (Official & LuaTools) is running.</p>
+  <p>Universal backup daemon for all Steam games is running.</p>
   <button onclick="fetch('/api/export', {{method:'POST', body:JSON.stringify({{appids:'all'}})}}).then(()=>alert('Backed up all games!'))">💾 Backup Whole Library</button>
 </body>
 </html>"""
@@ -551,6 +550,9 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
             bpath = payload.get("backup_path") or (os.path.join(DEFAULT_BACKUP_DIR, filename) if filename else None)
             appids = payload.get("appids")
             result = restore_games(backup_path=bpath, appids=appids)
+        elif parsed.path in ["/api/delete_backup", "/api/delete"]:
+            filename = payload.get("filename") or payload.get("backup_filename")
+            result = delete_backup(filename)
         elif parsed.path == "/api/inject":
             ok, msg = inject_into_steam()
             result = {"success": ok, "message": msg}
@@ -605,6 +607,10 @@ def main():
 
     # backups
     subparsers.add_parser("backups", help="List all available backups")
+
+    # delete
+    p_del = subparsers.add_parser("delete", help="Delete a backup file")
+    p_del.add_argument("filename", help="Backup filename to delete")
 
     # restore
     p_restore = subparsers.add_parser("restore", help="Restore games from backup")
@@ -666,6 +672,13 @@ def main():
             sz = f"{b['size'] / 1024:.1f} KB"
             print(f"{b['filename']:<48} {b['count']:2d} games | {sz} | {dt}")
         print("─" * 80)
+
+    elif args.command == "delete":
+        res = delete_backup(args.filename)
+        if res["success"]:
+            print(f"\n✓ Successfully deleted backup: {res['filename']}")
+        else:
+            print(f"\n✗ Delete failed: {res['error']}")
 
     elif args.command == "restore":
         if args.file:
