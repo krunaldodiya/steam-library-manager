@@ -1,7 +1,7 @@
 /**
  * Steam Library Manager - Dedicated In-Steam Frontend Plugin
  * Standalone Extension for Steam Client with Draggable Floating Button
- * Dedicated Backup and Restore Screens with Archive Picker & Selective Restore
+ * Dedicated Backup and Restore Screens with State-Aware Sync & Backup Buttons
  */
 
 (function () {
@@ -18,6 +18,7 @@
       "get_games": "/api/games",
       "get_archives": "/api/archives",
       "sync": "/api/sync",
+      "backup": "/api/backup",
       "inspect": "/api/inspect",
       "restore": "/api/restore",
       "delete_archive": "/api/delete_archive"
@@ -74,14 +75,13 @@
       <div class="slm-header-title">
         <span>📦</span>
         <span>Steam Library Manager</span>
-        <span class="slm-header-path">~/SteamLibrary-Backups/</span>
       </div>
       <button class="slm-header-close" title="Close">✕</button>
     `;
     header.querySelector(".slm-header-close").addEventListener("click", () => overlay.remove());
     win.appendChild(header);
 
-    // Tab Bar (Dedicated "Backup" and "Restore" screens)
+    // Tab Bar (Clean "Backup" and "Restore" screens)
     const tabs = document.createElement("div");
     tabs.className = "slm-tabs";
     tabs.innerHTML = `
@@ -139,19 +139,6 @@
       const notSyncedCount = totalCount - syncedCount;
 
       content.innerHTML = `
-        <div class="slm-action-bar">
-          <div style="display:flex;gap:10px;flex:1;align-items:center;min-width:320px;">
-            <input type="text" id="slm-search" class="slm-input" placeholder="🔍 Search games, AppID, or source...">
-            <button class="slm-btn-secondary" id="slm-toggle-all">Select All / None</button>
-          </div>
-
-          <div class="slm-global-btns">
-            <button class="slm-btn-primary" id="slm-btn-backup" disabled style="opacity:0.4;cursor:not-allowed;">
-              <span>💾</span><span>Backup (<span id="slm-sel-count">0</span>)</span>
-            </button>
-          </div>
-        </div>
-
         <div class="slm-filter-chips">
           <button class="slm-chip active" data-filter="all">All (${totalCount})</button>
           <button class="slm-chip" data-filter="installed">Installed (${instCount})</button>
@@ -161,27 +148,39 @@
           <button class="slm-chip" data-filter="official">Official Steam</button>
         </div>
 
-        <div class="slm-table-wrap">
-          <table class="slm-table">
-            <thead>
-              <tr>
-                <th width="32"><input type="checkbox" id="slm-th-chk"></th>
-                <th>Game Title</th>
-                <th width="90">AppID</th>
-                <th width="140">Source / Type</th>
-                <th width="130">Status</th>
-                <th width="160">Last Backup / Sync</th>
-                <th width="80">Action</th>
-              </tr>
-            </thead>
-            <tbody id="slm-games-body"></tbody>
-          </table>
+        <div class="slm-toolbar">
+          <input type="text" id="slm-search" class="slm-input" placeholder="🔍 Search games, AppID, or source...">
+          <button class="slm-btn-secondary" id="slm-toggle-all">Select All / None</button>
+          
+          <button class="slm-btn-secondary" id="slm-btn-sync" disabled style="opacity:0.4;cursor:not-allowed;">
+            <span>🔄</span><span>Sync (<span id="slm-sync-count">0</span>)</span>
+          </button>
+          <button class="slm-btn-primary" id="slm-btn-backup" disabled style="opacity:0.4;cursor:not-allowed;">
+            <span>💾</span><span>Backup (<span id="slm-sel-count">0</span>)</span>
+          </button>
         </div>
+
+        <table class="slm-table">
+          <thead>
+            <tr>
+              <th width="32"><input type="checkbox" id="slm-th-chk"></th>
+              <th>Game Title</th>
+              <th width="90">AppID</th>
+              <th width="140">Source / Type</th>
+              <th width="130">Status</th>
+              <th width="160">Last Backup / Sync</th>
+              <th width="80">Action</th>
+            </tr>
+          </thead>
+          <tbody id="slm-games-body"></tbody>
+        </table>
       `;
 
       const tbody = content.querySelector("#slm-games-body");
       const search = content.querySelector("#slm-search");
       const btnSelCount = content.querySelector("#slm-sel-count");
+      const btnSyncCount = content.querySelector("#slm-sync-count");
+      const btnSync = content.querySelector("#slm-btn-sync");
       const btnBackup = content.querySelector("#slm-btn-backup");
       const btnToggleAll = content.querySelector("#slm-toggle-all");
       const thChk = content.querySelector("#slm-th-chk");
@@ -195,15 +194,22 @@
         });
       });
 
-      // Update button enabled / disabled state
-      function updateSelState() {
+      // Update button state (enabled when >= 1 selected, disabled/readonly when 0)
+      function updateButtonStates() {
         const count = tbody.querySelectorAll(".slm-gchk:checked").length;
         btnSelCount.textContent = count;
+        btnSyncCount.textContent = count;
         if (count > 0) {
+          btnSync.disabled = false;
+          btnSync.style.opacity = "1";
+          btnSync.style.cursor = "pointer";
           btnBackup.disabled = false;
           btnBackup.style.opacity = "1";
           btnBackup.style.cursor = "pointer";
         } else {
+          btnSync.disabled = true;
+          btnSync.style.opacity = "0.4";
+          btnSync.style.cursor = "not-allowed";
           btnBackup.disabled = true;
           btnBackup.style.opacity = "0.4";
           btnBackup.style.cursor = "not-allowed";
@@ -229,7 +235,7 @@
 
         if (filtered.length === 0) {
           tbody.innerHTML = `<tr><td colspan="7" style="text-align:center;padding:30px;color:#8f98a0;">No games matching search or filter.</td></tr>`;
-          updateSelState();
+          updateButtonStates();
           return;
         }
 
@@ -254,20 +260,20 @@
             <td><span class="slm-badge ${srcClass}">${g.source}</span></td>
             <td>${statusBadge}</td>
             <td>${syncBadge}</td>
-            <td><button class="slm-btn-secondary" style="padding:3px 8px;font-size:11px;" title="Backup this game">Backup</button></td>
+            <td><button class="slm-btn-secondary" style="padding:3px 10px;font-size:11px;" title="Sync this game to its directory">Sync</button></td>
           `;
 
-          tr.querySelector(".slm-gchk").addEventListener("change", updateSelState);
+          tr.querySelector(".slm-gchk").addEventListener("change", updateButtonStates);
           tr.querySelector("button").addEventListener("click", async () => {
-            const res = await apiCall("sync", { appids: [g.appid], create_archive: true });
+            const res = await apiCall("sync", { appids: [g.appid], create_archive: false });
             if (res.success) {
-              showToast(`✓ Backed up ${g.name} to games/${g.appid}/ & archive bundle`);
+              showToast(`✓ Synced ${g.name} to games/${g.appid}/`);
               loadData();
             }
           });
           tbody.appendChild(tr);
         });
-        updateSelState();
+        updateButtonStates();
       }
 
       search.addEventListener("input", () => populate(search.value));
@@ -277,28 +283,46 @@
         const anyUnchecked = Array.from(chks).some(c => !c.checked);
         chks.forEach(c => c.checked = anyUnchecked);
         if (thChk) thChk.checked = anyUnchecked;
-        updateSelState();
+        updateButtonStates();
       });
 
       if (thChk) {
         thChk.addEventListener("change", () => {
           tbody.querySelectorAll(".slm-gchk").forEach(c => c.checked = thChk.checked);
-          updateSelState();
+          updateButtonStates();
         });
       }
 
-      // Global Backup Action (Always updates single source directory AND creates archive)
+      // Top-level Sync Action (Syncs selected to games/ directory without creating tar)
+      btnSync.addEventListener("click", async () => {
+        const selected = Array.from(tbody.querySelectorAll(".slm-gchk:checked")).map(c => parseInt(c.value));
+        if (selected.length === 0) return;
+
+        btnSync.disabled = true;
+        btnSync.innerHTML = "<span>🔄</span><span>Syncing...</span>";
+        const res = await apiCall("sync", { appids: selected, create_archive: false });
+        btnSync.disabled = false;
+        btnSync.innerHTML = `<span>🔄</span><span>Sync (<span id="slm-sync-count">0</span>)</span>`;
+        if (res.success) {
+          showToast(`✓ Synced ${res.synced_count} game(s) to single-source directory!`);
+          loadData();
+        } else {
+          showToast(`✗ Sync failed: ${res.error}`);
+        }
+      });
+
+      // Top-level Backup Action (Syncs to games/ directory AND creates .tar.gz bundle)
       btnBackup.addEventListener("click", async () => {
         const selected = Array.from(tbody.querySelectorAll(".slm-gchk:checked")).map(c => parseInt(c.value));
         if (selected.length === 0) return;
 
         btnBackup.disabled = true;
         btnBackup.innerHTML = "<span>💾</span><span>Backing up...</span>";
-        const res = await apiCall("sync", { appids: selected, create_archive: true });
+        const res = await apiCall("backup", { appids: selected });
         btnBackup.disabled = false;
         btnBackup.innerHTML = `<span>💾</span><span>Backup (<span id="slm-sel-count">0</span>)</span>`;
         if (res.success) {
-          let msg = `✓ Backed up ${res.synced_count} game(s) to subdirectories & created archive!`;
+          let msg = `✓ Backed up ${res.synced_count} game(s) & created archive!`;
           if (res.archive_name) msg += ` (${res.archive_name})`;
           showToast(msg);
           loadData();
@@ -313,7 +337,7 @@
     // ── 2. Restore Screen ───────────────────────────────────────────────────────
     function renderRestoreScreen() {
       content.innerHTML = `
-        <div class="slm-action-bar">
+        <div class="slm-toolbar" style="justify-content:space-between;">
           <div>
             <h3 style="margin:0;color:#fff;font-size:15px;">Available Backup Archives</h3>
             <small style="color:#8f98a0;">Select an archive below to choose games and restore.</small>
@@ -321,20 +345,18 @@
           <button class="slm-btn-secondary" id="slm-refresh-archives">🔄 Refresh</button>
         </div>
 
-        <div class="slm-table-wrap">
-          <table class="slm-table">
-            <thead>
-              <tr>
-                <th>Backup Archive</th>
-                <th width="100">Games</th>
-                <th width="110">Size</th>
-                <th width="180">Created</th>
-                <th width="180">Actions</th>
-              </tr>
-            </thead>
-            <tbody id="slm-archives-body"></tbody>
-          </table>
-        </div>
+        <table class="slm-table">
+          <thead>
+            <tr>
+              <th>Backup Archive</th>
+              <th width="100">Games</th>
+              <th width="110">Size</th>
+              <th width="180">Created</th>
+              <th width="180">Actions</th>
+            </tr>
+          </thead>
+          <tbody id="slm-archives-body"></tbody>
+        </table>
       `;
 
       const tbody = content.querySelector("#slm-archives-body");
@@ -360,7 +382,7 @@
 
       if (!state.archives || state.archives.length === 0) {
         const noTr = document.createElement("tr");
-        noTr.innerHTML = `<td colspan="5" style="text-align:center;padding:24px;color:#8f98a0;">No standalone archive bundles found in archives/. (Create one from the Backup screen).</td>`;
+        noTr.innerHTML = `<td colspan="5" style="text-align:center;padding:24px;color:#8f98a0;">No standalone archive bundles found in archives/. Click Backup to generate one.</td>`;
         tbody.appendChild(noTr);
         return;
       }
@@ -501,7 +523,6 @@
         }
       }
 
-      // Inspect source to get games list
       const res = await apiCall("inspect", {
         source_type: isDir ? "directory" : "archive",
         archive_path: isDir ? null : sourceItem.path
@@ -549,7 +570,6 @@
         });
       }
 
-      // Confirm Restore Execution
       popConfirm.addEventListener("click", async () => {
         const chosen = Array.from(popBody.querySelectorAll(".slm-pop-chk:checked")).map(c => parseInt(c.value));
         if (chosen.length === 0) return;

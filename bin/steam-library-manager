@@ -757,9 +757,9 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
         except Exception:
             payload = {}
 
-        if parsed.path == "/api/sync":
+        if parsed.path in ["/api/sync", "/api/backup"]:
             appids = payload.get("appids")
-            create_tar = bool(payload.get("create_archive", False))
+            create_tar = True if parsed.path == "/api/backup" else bool(payload.get("create_archive", False))
             tar_name = payload.get("archive_name")
             result = sync_games(appids=appids, create_tar=create_tar, tar_name=tar_name)
 
