@@ -54,10 +54,10 @@
 }
 
 #slm-modal-window {
-  width: 900px;
-  max-width: 92vw;
-  height: 680px;
-  max-height: 90vh;
+  width: 960px;
+  max-width: 94vw;
+  height: 720px;
+  max-height: 92vh;
   background: #171a21;
   border: 1px solid #2e3543;
   border-radius: 8px;
@@ -138,6 +138,27 @@
   margin-bottom: 16px;
   flex-wrap: wrap;
 }
+.slm-filter-chips {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 12px;
+}
+.slm-chip {
+  background: #202633;
+  border: 1px solid #2f384a;
+  color: #8f98a0;
+  font-size: 12px;
+  font-weight: 600;
+  padding: 4px 10px;
+  border-radius: 12px;
+  cursor: pointer;
+}
+.slm-chip.active {
+  background: #1a9fff;
+  color: #ffffff;
+  border-color: #1a9fff;
+}
+
 .slm-input {
   background: #101217;
   border: 1px solid #2e3543;
@@ -211,6 +232,21 @@
 .slm-badge.library {
   background: rgba(26, 159, 255, 0.18);
   color: #1a9fff;
+}
+.slm-badge.official {
+  background: rgba(33, 150, 243, 0.2);
+  color: #64b5f6;
+  border: 1px solid rgba(33, 150, 243, 0.3);
+}
+.slm-badge.luatools {
+  background: rgba(156, 39, 176, 0.2);
+  color: #ba68c8;
+  border: 1px solid rgba(156, 39, 176, 0.3);
+}
+.slm-badge.both {
+  background: rgba(0, 150, 136, 0.2);
+  color: #4db6ac;
+  border: 1px solid rgba(0, 150, 136, 0.3);
 }
 
 .slm-toast {

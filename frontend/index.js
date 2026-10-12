@@ -1,10 +1,10 @@
 /**
  * Steam Library Manager - Dedicated In-Steam Frontend Plugin
  * Standalone Extension for Steam Client with Draggable Floating Button
+ * Universal Steam Game Support (Official Purchased & LuaTools/SLSsteam Managed)
  */
 
 (function () {
-  // Remove any previous versions / buttons
   const prevBtn = document.getElementById("slm-topbar-btn");
   if (prevBtn) prevBtn.remove();
   const prevFloat = document.getElementById("slm-floating-btn");
@@ -13,7 +13,6 @@
   const API_PORT = 8343;
   const BACKEND_URL = `http://127.0.0.1:${API_PORT}`;
 
-  // Dedicated Backend Bridge
   async function apiCall(method, params = {}) {
     const endpointMap = {
       "get_games": "/api/games",
@@ -30,7 +29,6 @@
     return await res.json();
   }
 
-  // Toast System
   function showToast(text) {
     let toast = document.getElementById("slm-toast");
     if (!toast) {
@@ -44,7 +42,6 @@
     setTimeout(() => { toast.style.display = "none"; }, 4000);
   }
 
-  // Build Modal Dialog
   function openManagerModal() {
     let existing = document.getElementById("slm-modal-overlay");
     if (existing) {
@@ -54,6 +51,7 @@
 
     let state = {
       activeTab: "export",
+      activeFilter: "all",
       games: [],
       backups: []
     };
@@ -73,7 +71,7 @@
     header.innerHTML = `
       <div class="slm-header-title">
         <span>📦</span>
-        <span>Backup & Restore (Library Manager)</span>
+        <span>Backup & Restore (Universal Steam Library Manager)</span>
       </div>
       <button class="slm-header-close" title="Close">✕</button>
     `;
@@ -89,7 +87,6 @@
     `;
     win.appendChild(tabs);
 
-    // Content Body
     const content = document.createElement("div");
     content.className = "slm-content";
     win.appendChild(content);
@@ -107,7 +104,7 @@
     });
 
     async function loadData() {
-      content.innerHTML = `<div style="text-align:center;padding:40px;color:#8f98a0;">Loading library data...</div>`;
+      content.innerHTML = `<div style="text-align:center;padding:40px;color:#8f98a0;">Loading universal library data...</div>`;
       try {
         const [gRes, bRes] = await Promise.all([
           apiCall("get_games"),
@@ -120,7 +117,7 @@
         content.innerHTML = `
           <div style="text-align:center;padding:40px;color:#ec5c5c;">
             Failed to connect to backend engine.<br>
-            <small style="color:#8f98a0;">Make sure steam-library-manager daemon is running (port ${API_PORT}).</small>
+            <small style="color:#8f98a0;">Make sure steam-library-manager daemon is active.</small>
           </div>
         `;
       }
@@ -133,9 +130,21 @@
 
     // ── Export Tab ─────────────────────────────────────────────────────────────
     function renderExportTab() {
+      const totalCount = state.games.length;
+      const instCount = state.games.filter(g => g.installed).length;
+      const officialCount = state.games.filter(g => (g.source || "").includes("Official")).length;
+      const luaCount = state.games.filter(g => g.has_lua).length;
+
       content.innerHTML = `
+        <div class="slm-filter-chips">
+          <button class="slm-chip active" data-filter="all">All (${totalCount})</button>
+          <button class="slm-chip" data-filter="installed">Installed (${instCount})</button>
+          <button class="slm-chip" data-filter="official">Official / Purchased (${officialCount})</button>
+          <button class="slm-chip" data-filter="luatools">LuaTools Managed (${luaCount})</button>
+        </div>
+
         <div class="slm-toolbar">
-          <input type="text" id="slm-search" class="slm-input" placeholder="🔍 Search games or AppID...">
+          <input type="text" id="slm-search" class="slm-input" placeholder="🔍 Search games, AppID, or source...">
           <button class="slm-btn-secondary" id="slm-toggle-all">Select All / None</button>
           <button class="slm-btn-primary" id="slm-export-selected">💾 Export Selected (<span id="slm-sel-count">0</span>)</button>
           <button class="slm-btn-primary" style="background:#2874a6;" id="slm-export-all">📦 Backup Whole Library</button>
@@ -147,8 +156,9 @@
               <th width="30"><input type="checkbox" id="slm-th-chk"></th>
               <th>Game Title</th>
               <th>AppID</th>
+              <th>Source / Type</th>
               <th>Status</th>
-              <th width="100">Action</th>
+              <th width="90">Action</th>
             </tr>
           </thead>
           <tbody id="slm-games-body"></tbody>
@@ -163,6 +173,15 @@
       const btnToggleAll = content.querySelector("#slm-toggle-all");
       const thChk = content.querySelector("#slm-th-chk");
 
+      content.querySelectorAll(".slm-chip").forEach(chip => {
+        chip.addEventListener("click", () => {
+          content.querySelectorAll(".slm-chip").forEach(c => c.classList.remove("active"));
+          chip.classList.add("active");
+          state.activeFilter = chip.dataset.filter;
+          populate(search.value);
+        });
+      });
+
       function updateSelCount() {
         const n = tbody.querySelectorAll(".slm-gchk:checked").length;
         btnSelCount.textContent = n;
@@ -171,25 +190,40 @@
       function populate(q = "") {
         tbody.innerHTML = "";
         const query = q.toLowerCase();
-        const filtered = state.games.filter(g =>
-          (g.name || "").toLowerCase().includes(query) || (g.appid || "").toString().includes(query)
+        let list = state.games;
+
+        if (state.activeFilter === "installed") list = list.filter(g => g.installed);
+        else if (state.activeFilter === "official") list = list.filter(g => (g.source || "").includes("Official"));
+        else if (state.activeFilter === "luatools") list = list.filter(g => g.has_lua);
+
+        const filtered = list.filter(g =>
+          (g.name || "").toLowerCase().includes(query) ||
+          (g.appid || "").toString().includes(query) ||
+          (g.source || "").toLowerCase().includes(query)
         );
 
         if (filtered.length === 0) {
-          tbody.innerHTML = `<tr><td colspan="5" style="text-align:center;padding:24px;color:#8f98a0;">No games matching search.</td></tr>`;
+          tbody.innerHTML = `<tr><td colspan="6" style="text-align:center;padding:24px;color:#8f98a0;">No games matching search/filter.</td></tr>`;
           return;
         }
 
         filtered.forEach(g => {
           const tr = document.createElement("tr");
-          const badgeClass = g.installed ? "installed" : "library";
-          const badgeText = g.installed ? "Installed" : "In Library";
+
+          let srcClass = "official";
+          if (g.source === "LuaTools / SLSsteam") srcClass = "luatools";
+          else if (g.source === "Official / LuaTools") srcClass = "both";
+
+          let statusBadge = g.installed
+            ? `<span class="slm-badge installed">Installed${g.size_on_disk ? ' (' + (g.size_on_disk / 1e9).toFixed(1) + ' GB)' : ''}</span>`
+            : `<span class="slm-badge library">In Library</span>`;
 
           tr.innerHTML = `
             <td><input type="checkbox" class="slm-gchk" value="${g.appid}"></td>
             <td style="font-weight:600;color:#fff;">${g.name}</td>
             <td style="color:#8f98a0;">${g.appid}</td>
-            <td><span class="slm-badge ${badgeClass}">${badgeText}</span></td>
+            <td><span class="slm-badge ${srcClass}">${g.source}</span></td>
+            <td>${statusBadge}</td>
             <td><button class="slm-btn-secondary" style="padding:4px 10px;font-size:11px;" data-appid="${g.appid}">Export</button></td>
           `;
 
@@ -313,7 +347,7 @@
         tr.querySelector("[data-action='sel']").addEventListener("click", async () => {
           const gamesList = b.games || [];
           const msg = "Enter AppIDs to restore separated by comma (leave blank to restore all):\\n\\n" +
-            gamesList.map(g => `${g.appid}: ${g.name}`).join("\\n");
+            gamesList.map(g => `${g.appid}: ${g.name} (${g.source || 'Steam'})`).join("\\n");
           const input = prompt(msg);
           if (input === null) return;
           const aids = input.trim() === "" ? "all" : input.split(",").map(s => parseInt(s.trim())).filter(n => !isNaN(n));
@@ -337,7 +371,6 @@
   function injectFloatingButton() {
     if (document.getElementById("slm-floating-btn")) return;
 
-    // Clean up any old topbar button
     const oldBtn = document.getElementById("slm-topbar-btn");
     if (oldBtn) oldBtn.remove();
 
@@ -346,7 +379,6 @@
     btn.innerHTML = `<span class="slm-drag-handle">⋮⋮</span><span>📦 Backup & Restore</span>`;
     btn.title = "Drag to move anywhere • Click to open Backup & Restore";
 
-    // Restore saved position if available
     try {
       const saved = localStorage.getItem("slm_btn_pos");
       if (saved) {
@@ -360,14 +392,13 @@
       }
     } catch (e) {}
 
-    // Drag & Drop State
     let isDragging = false;
     let dragStartX = 0, dragStartY = 0;
     let initialLeft = 0, initialTop = 0;
     let movedDistance = 0;
 
     btn.addEventListener("mousedown", (e) => {
-      if (e.button !== 0) return; // Left click only
+      if (e.button !== 0) return;
       isDragging = true;
       movedDistance = 0;
       dragStartX = e.clientX;
@@ -403,7 +434,6 @@
         window.removeEventListener("mousemove", onMouseMove);
         window.removeEventListener("mouseup", onMouseUp);
 
-        // Save position if dragged
         if (movedDistance > 5) {
           const rect = btn.getBoundingClientRect();
           try {
@@ -416,7 +446,6 @@
       window.addEventListener("mouseup", onMouseUp);
     });
 
-    // Click handler (only trigger if not a drag action)
     btn.addEventListener("click", (e) => {
       if (movedDistance > 5) {
         e.preventDefault();
@@ -429,7 +458,6 @@
     document.body.appendChild(btn);
   }
 
-  // Keep floating button mounted across Steam client navigation
   setInterval(injectFloatingButton, 2000);
   injectFloatingButton();
 

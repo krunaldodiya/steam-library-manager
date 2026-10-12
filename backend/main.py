@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """
 Steam Library Manager - Backend Engine
-Handles game metadata extraction, export (All, Multi, Single), and restore.
-Compatible with Millennium Python Plugin runtime and standalone execution.
+Universal metadata manager (Official Steam & LuaTools/SLSsteam).
 """
 
 import os
@@ -52,80 +51,98 @@ def get_steam_libraries():
             pass
     return roots
 
-def resolve_game_names():
+def get_all_library_games():
     names = dict(KNOWN_NAMES)
-    for lib in get_steam_libraries():
-        manifests = glob.glob(os.path.join(lib, "steamapps/appmanifest_*.acf"))
-        for m in manifests:
+    games_map = {}
+    roots = get_steam_libraries()
+
+    for r in set(roots):
+        for acf in glob.glob(os.path.join(r, "steamapps/appmanifest_*.acf")):
             try:
-                with open(m, "r", encoding="utf-8", errors="ignore") as f:
-                    data = f.read()
-                aid = re.search(r'"appid"\s+"(\d+)"', data)
-                name = re.search(r'"name"\s+"([^"]+)"', data)
+                with open(acf, "r", encoding="utf-8", errors="ignore") as f:
+                    txt = f.read()
+                aid = re.search(r'"appid"\s+"(\d+)"', txt)
+                name = re.search(r'"name"\s+"([^"]+)"', txt)
+                inst_dir = re.search(r'"installdir"\s+"([^"]+)"', txt)
+                sz = re.search(r'"SizeOnDisk"\s+"(\d+)"', txt)
+                buildid = re.search(r'"buildid"\s+"([^"]+)"', txt)
+
                 if aid and name:
-                    names[int(aid.group(1))] = name.group(1)
+                    a = int(aid.group(1))
+                    if a in [228980, 1493710, 4183110]:
+                        continue
+                    names[a] = name.group(1)
+                    games_map[a] = {
+                        "appid": a,
+                        "name": name.group(1),
+                        "installed": True,
+                        "installdir": inst_dir.group(1) if inst_dir else "",
+                        "size_on_disk": int(sz.group(1)) if sz else 0,
+                        "buildid": buildid.group(1) if buildid else "",
+                        "acf_path": acf,
+                        "library_path": r,
+                        "has_acf": True,
+                        "has_lua": False,
+                        "source": "Official Steam"
+                    }
             except Exception:
                 pass
-    return names
 
-def get_installed_appids():
-    installed = set()
-    for lib in get_steam_libraries():
-        manifests = glob.glob(os.path.join(lib, "steamapps/appmanifest_*.acf"))
-        for m in manifests:
+    if os.path.exists(DEFAULT_STPLUG_DIR):
+        for f in os.listdir(DEFAULT_STPLUG_DIR):
+            if not f.endswith(".lua"):
+                continue
             try:
-                with open(m, "r", encoding="utf-8", errors="ignore") as f:
-                    data = f.read()
-                aid = re.search(r'"appid"\s+"(\d+)"', data)
-                if aid:
-                    installed.add(int(aid.group(1)))
+                a = int(f[:-4])
+            except ValueError:
+                continue
+
+            gname = names.get(a, f"AppID {a}")
+            lpath = os.path.join(DEFAULT_STPLUG_DIR, f)
+            depots = []
+            try:
+                with open(lpath, "r", encoding="utf-8", errors="ignore") as lf:
+                    ltext = lf.read()
+                depots = [int(d) for d in re.findall(r'addappid\((\d+)', ltext)]
             except Exception:
                 pass
-    return installed
 
-def get_managed_games():
-    names = resolve_game_names()
-    installed = get_installed_appids()
-    games = []
-    if not os.path.exists(DEFAULT_STPLUG_DIR):
-        return games
+            if a not in games_map:
+                games_map[a] = {
+                    "appid": a,
+                    "name": gname,
+                    "installed": False,
+                    "size_on_disk": 0,
+                    "has_acf": False,
+                    "has_lua": True,
+                    "lua_file": f,
+                    "depots": depots,
+                    "source": "LuaTools / SLSsteam"
+                }
+            else:
+                games_map[a]["has_lua"] = True
+                games_map[a]["lua_file"] = f
+                games_map[a]["depots"] = depots
+                games_map[a]["source"] = "Official / LuaTools"
 
-    for fname in sorted(os.listdir(DEFAULT_STPLUG_DIR)):
-        if not fname.endswith(".lua"):
-            continue
-        try:
-            aid = int(fname[:-4])
-        except ValueError:
-            continue
-        fpath = os.path.join(DEFAULT_STPLUG_DIR, fname)
-        size = os.path.getsize(fpath)
-        mtime = os.path.getmtime(fpath)
-        game_name = names.get(aid, f"AppID {aid}")
-        is_inst = aid in installed
+    for a, gname in names.items():
+        if a not in games_map and a not in [228980, 1493710, 4183110]:
+            games_map[a] = {
+                "appid": a,
+                "name": gname,
+                "installed": False,
+                "size_on_disk": 0,
+                "has_acf": False,
+                "has_lua": False,
+                "source": "Official Steam Account"
+            }
 
-        depots = []
-        try:
-            with open(fpath, "r", encoding="utf-8", errors="ignore") as lf:
-                ltext = lf.read()
-            depots = [int(d) for d in re.findall(r'addappid\((\d+)', ltext)]
-        except Exception:
-            pass
-
-        games.append({
-            "appid": aid,
-            "name": game_name,
-            "installed": is_inst,
-            "lua_file": fname,
-            "lua_size": size,
-            "mtime": mtime,
-            "depots": depots
-        })
-    return games
+    return [games_map[k] for k in sorted(games_map.keys(), key=lambda x: games_map[x]["name"].lower())]
 
 def export_games(appids=None, backup_name=None, backup_dir=DEFAULT_BACKUP_DIR):
-    all_games = get_managed_games()
+    all_games = get_all_library_games()
     if not all_games:
-        return {"success": False, "error": "No managed games found in stplug-in"}
+        return {"success": False, "error": "No games found in Steam library"}
 
     if appids is None or appids == "all":
         selected_games = all_games
@@ -152,7 +169,7 @@ def export_games(appids=None, backup_name=None, backup_dir=DEFAULT_BACKUP_DIR):
 
     zip_path = os.path.join(backup_dir, backup_name)
     metadata = {
-        "version": "1.0",
+        "version": "2.0",
         "created_at": ts,
         "total_games": len(selected_games),
         "games": selected_games
@@ -161,17 +178,24 @@ def export_games(appids=None, backup_name=None, backup_dir=DEFAULT_BACKUP_DIR):
     manifests_dir = os.path.join(DEFAULT_SLS_DIR, "manifests")
     all_depots = set()
     for g in selected_games:
-        all_depots.update(g["depots"])
+        for d in g.get("depots", []):
+            all_depots.add(d)
 
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("metadata.json", json.dumps(metadata, indent=2))
 
         for g in selected_games:
-            src = os.path.join(DEFAULT_STPLUG_DIR, g["lua_file"])
-            if os.path.exists(src):
-                zf.write(src, f"stplug-in/{g['lua_file']}")
+            if g.get("has_lua") and g.get("lua_file"):
+                src = os.path.join(DEFAULT_STPLUG_DIR, g["lua_file"])
+                if os.path.exists(src):
+                    zf.write(src, f"stplug-in/{g['lua_file']}")
 
-        if os.path.exists(manifests_dir):
+            if g.get("has_acf") and g.get("acf_path"):
+                if os.path.exists(g["acf_path"]):
+                    fname = os.path.basename(g["acf_path"])
+                    zf.write(g["acf_path"], f"acfs/{fname}")
+
+        if os.path.exists(manifests_dir) and all_depots:
             for mfile in os.listdir(manifests_dir):
                 m_match = re.match(r"^(\d+)_\d+\.manifest$", mfile)
                 if m_match and int(m_match.group(1)) in all_depots:
@@ -211,6 +235,9 @@ def list_backups(backup_dir=DEFAULT_BACKUP_DIR):
                         if n.startswith("stplug-in/") and n.endswith(".lua"):
                             aid = int(n[10:-4])
                             games_list.append({"appid": aid, "name": KNOWN_NAMES.get(aid, f"AppID {aid}")})
+                        elif n.startswith("acfs/appmanifest_") and n.endswith(".acf"):
+                            aid = int(n[17:-4])
+                            games_list.append({"appid": aid, "name": KNOWN_NAMES.get(aid, f"AppID {aid}")})
         except Exception:
             pass
 
@@ -237,6 +264,8 @@ def restore_games(backup_path=None, appids=None, backup_dir=DEFAULT_BACKUP_DIR):
     os.makedirs(DEFAULT_STPLUG_DIR, exist_ok=True)
     manifests_dir = os.path.join(DEFAULT_SLS_DIR, "manifests")
     os.makedirs(manifests_dir, exist_ok=True)
+    steamapps_dir = os.path.join(DEFAULT_STEAM_ROOT, "steamapps")
+    os.makedirs(steamapps_dir, exist_ok=True)
 
     restored = []
     with zipfile.ZipFile(backup_path, "r") as zf:
@@ -270,7 +299,30 @@ def restore_games(backup_path=None, appids=None, backup_dir=DEFAULT_BACKUP_DIR):
                     f.write(zf.read(member))
 
                 g_info = avail_map.get(aid, {"appid": aid, "name": KNOWN_NAMES.get(aid, f"AppID {aid}")})
-                restored.append(g_info)
+                if g_info not in restored:
+                    restored.append(g_info)
+
+            elif member.startswith("acfs/") and member.endswith(".acf"):
+                fname = os.path.basename(member)
+                aid_match = re.search(r"appmanifest_(\d+)\.acf", fname)
+                if aid_match:
+                    aid = int(aid_match.group(1))
+                    if target_appids is not None and aid not in target_appids:
+                        continue
+
+                    target_lib = steamapps_dir
+                    if aid in avail_map and avail_map[aid].get("library_path"):
+                        lib_p = avail_map[aid]["library_path"]
+                        if os.path.exists(lib_p):
+                            target_lib = os.path.join(lib_p, "steamapps")
+
+                    dest = os.path.join(target_lib, fname)
+                    with open(dest, "wb") as f:
+                        f.write(zf.read(member))
+
+                    g_info = avail_map.get(aid, {"appid": aid, "name": KNOWN_NAMES.get(aid, f"AppID {aid}")})
+                    if g_info not in restored:
+                        restored.append(g_info)
 
             elif member.startswith("manifests/") and member.endswith(".manifest"):
                 fname = os.path.basename(member)
@@ -290,28 +342,3 @@ def restore_games(backup_path=None, appids=None, backup_dir=DEFAULT_BACKUP_DIR):
         "games": restored,
         "backup_path": backup_path
     }
-
-# Millennium Plugin Hooks (if loaded by Millennium)
-try:
-    import Millennium
-    class Plugin:
-        def _load(self):
-            print("[SteamLibraryManager] Millennium plugin loaded successfully.")
-        def _unload(self):
-            pass
-        def get_games(self):
-            return json.dumps(get_managed_games())
-        def export(self, payload):
-            p = json.loads(payload) if isinstance(payload, str) else payload
-            return json.dumps(export_games(appids=p.get("appids"), backup_name=p.get("name")))
-        def restore(self, payload):
-            p = json.loads(payload) if isinstance(payload, str) else payload
-            return json.dumps(restore_games(backup_path=p.get("backup_path"), appids=p.get("appids")))
-        def get_backups(self):
-            return json.dumps(list_backups())
-except ImportError:
-    pass
-
-if __name__ == "__main__":
-    print("Steam Library Manager Engine")
-    print(f"Total managed games: {len(get_managed_games())}")
