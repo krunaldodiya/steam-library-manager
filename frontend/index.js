@@ -1,11 +1,14 @@
 /**
  * Steam Library Manager - Dedicated In-Steam Frontend Plugin
- * Standalone Extension for Steam Client
+ * Standalone Extension for Steam Client with Draggable Floating Button
  */
 
 (function () {
-  if (window.__SteamLibraryManagerInjected) return;
-  window.__SteamLibraryManagerInjected = true;
+  // Remove any previous versions / buttons
+  const prevBtn = document.getElementById("slm-topbar-btn");
+  if (prevBtn) prevBtn.remove();
+  const prevFloat = document.getElementById("slm-floating-btn");
+  if (prevFloat) prevFloat.remove();
 
   const API_PORT = 8343;
   const BACKEND_URL = `http://127.0.0.1:${API_PORT}`;
@@ -46,6 +49,7 @@
     let existing = document.getElementById("slm-modal-overlay");
     if (existing) {
       existing.remove();
+      return;
     }
 
     let state = {
@@ -69,7 +73,7 @@
     header.innerHTML = `
       <div class="slm-header-title">
         <span>📦</span>
-        <span>Steam Library Manager</span>
+        <span>Backup & Restore (Library Manager)</span>
       </div>
       <button class="slm-header-close" title="Close">✕</button>
     `;
@@ -329,29 +333,105 @@
     loadData();
   }
 
-  // Inject Dedicated Topbar Button into Steam UI
-  function injectTopBarButton() {
-    if (document.getElementById("slm-topbar-btn")) return;
+  // Draggable Floating Button Implementation
+  function injectFloatingButton() {
+    if (document.getElementById("slm-floating-btn")) return;
 
-    const target = document.querySelector(".title-area-icon-inner")?.parentElement?.parentElement ||
-                   document.querySelector("._2D64jIEK7wpUR_NlObDW76") ||
-                   document.querySelector(".RootMenuBar") ||
-                   document.querySelector("nav") ||
-                   document.body;
-
-    if (!target) return;
+    // Clean up any old topbar button
+    const oldBtn = document.getElementById("slm-topbar-btn");
+    if (oldBtn) oldBtn.remove();
 
     const btn = document.createElement("div");
-    btn.id = "slm-topbar-btn";
-    btn.innerHTML = `<span>📦</span><span>Library Manager</span>`;
-    btn.title = "Steam Library Manager (Backup & Restore)";
-    btn.addEventListener("click", openManagerModal);
+    btn.id = "slm-floating-btn";
+    btn.innerHTML = `<span class="slm-drag-handle">⋮⋮</span><span>📦 Backup & Restore</span>`;
+    btn.title = "Drag to move anywhere • Click to open Backup & Restore";
 
-    target.appendChild(btn);
+    // Restore saved position if available
+    try {
+      const saved = localStorage.getItem("slm_btn_pos");
+      if (saved) {
+        const pos = JSON.parse(saved);
+        if (typeof pos.left === "number" && typeof pos.top === "number") {
+          btn.style.left = `${Math.min(window.innerWidth - 180, Math.max(10, pos.left))}px`;
+          btn.style.top = `${Math.min(window.innerHeight - 50, Math.max(10, pos.top))}px`;
+          btn.style.right = "auto";
+          btn.style.bottom = "auto";
+        }
+      }
+    } catch (e) {}
+
+    // Drag & Drop State
+    let isDragging = false;
+    let dragStartX = 0, dragStartY = 0;
+    let initialLeft = 0, initialTop = 0;
+    let movedDistance = 0;
+
+    btn.addEventListener("mousedown", (e) => {
+      if (e.button !== 0) return; // Left click only
+      isDragging = true;
+      movedDistance = 0;
+      dragStartX = e.clientX;
+      dragStartY = e.clientY;
+
+      const rect = btn.getBoundingClientRect();
+      initialLeft = rect.left;
+      initialTop = rect.top;
+
+      btn.style.transition = "none";
+      document.body.style.userSelect = "none";
+
+      const onMouseMove = (moveEvt) => {
+        if (!isDragging) return;
+        const dx = moveEvt.clientX - dragStartX;
+        const dy = moveEvt.clientY - dragStartY;
+        movedDistance = Math.hypot(dx, dy);
+
+        let newLeft = Math.max(10, Math.min(window.innerWidth - btn.offsetWidth - 10, initialLeft + dx));
+        let newTop = Math.max(10, Math.min(window.innerHeight - btn.offsetHeight - 10, initialTop + dy));
+
+        btn.style.left = `${newLeft}px`;
+        btn.style.top = `${newTop}px`;
+        btn.style.right = "auto";
+        btn.style.bottom = "auto";
+      };
+
+      const onMouseUp = () => {
+        if (!isDragging) return;
+        isDragging = false;
+        btn.style.transition = "background 0.18s, border-color 0.18s, color 0.18s, box-shadow 0.18s";
+        document.body.style.userSelect = "";
+        window.removeEventListener("mousemove", onMouseMove);
+        window.removeEventListener("mouseup", onMouseUp);
+
+        // Save position if dragged
+        if (movedDistance > 5) {
+          const rect = btn.getBoundingClientRect();
+          try {
+            localStorage.setItem("slm_btn_pos", JSON.stringify({ left: rect.left, top: rect.top }));
+          } catch (e) {}
+        }
+      };
+
+      window.addEventListener("mousemove", onMouseMove);
+      window.addEventListener("mouseup", onMouseUp);
+    });
+
+    // Click handler (only trigger if not a drag action)
+    btn.addEventListener("click", (e) => {
+      if (movedDistance > 5) {
+        e.preventDefault();
+        e.stopPropagation();
+        return;
+      }
+      openManagerModal();
+    });
+
+    document.body.appendChild(btn);
   }
 
-  setInterval(injectTopBarButton, 2000);
-  injectTopBarButton();
+  // Keep floating button mounted across Steam client navigation
+  setInterval(injectFloatingButton, 2000);
+  injectFloatingButton();
 
   window.OpenSteamLibraryManager = openManagerModal;
 })();
