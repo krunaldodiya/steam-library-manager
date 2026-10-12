@@ -1,115 +1,62 @@
 # 🎮 Steam Library Manager
 
-A dedicated, standalone plugin, CLI, and GUI for managing, exporting, and restoring Steam games metadata (specifically built for **SLSsteam / LuaTools / SteamTools** environments).
+A dedicated, standalone Steam plugin, CLI, and engine for managing, backing up, and restoring Steam games metadata.
 
 ---
 
-## ⚡ The Problem Solved
+## ⚡ Architecture: Single Source of Truth
 
-When using tools like **LuaTools / SLSsteam**, games added to your library or uninstalled often disappear because their licenses are stored locally rather than in Valve's cloud account servers. Reinstalling Steam or accidentally uninstalling games wipes the metadata, forcing users to re-add every game manually.
+Unlike utilities that produce opaque, monolithic archives, **Steam Library Manager** organizes your backup repository as a transparent **directory tree with per-game subdirectories**:
 
-**Steam Library Manager solves this with zero disk waste:**
-* Backs up **only the lightweight metadata** (`.lua` manifests, depot keys, pins) — typically **~100 KB total**.
-* **Zero game files are copied or moved.**
-* When restored, Steam immediately displays the **"Install / Download"** button for every game, exactly as if it were a purchased title.
-
----
-
-## 🚀 Key Features
-
-* **Complete Export Options:**
-  * 📦 **Whole Library:** Back up all games in one click.
-  * 🔘 **Multi-Select:** Check off any combination of games and export together.
-  * 🎮 **Single Game:** Export individual game metadata packages.
-* **Complete Restore Options:**
-  * 📥 **Whole Library Restore:** Restores an entire archive bundle at once.
-  * 🔘 **Multi-Select Restore:** Choose specific games from any backup bundle.
-  * 🎮 **Single Game Restore:** Pick one specific game to restore.
-  * 📁 **Direct `.lua` File Import:** Import raw `.lua` scripts directly into Steam.
-* **Dedicated & Standalone:**
-  * Follows the **Millennium Plugin Specification** (`plugin.json`).
-  * Dedicated standalone in-Steam interface.
-  * **Not dependent on Lumen** or any other plugin.
-  * Works via **Terminal CLI**, **Dedicated Web GUI**, and **Desktop App**.
-
----
-
-## 📦 Installation
-
-```bash
-git clone https://github.com/krunaldodiya/steam-library-manager.git ~/WorkSpace/Code/steam-library-manager
-cd ~/WorkSpace/Code/steam-library-manager
-./install.sh
+```text
+~/SteamLibrary-Backups/
+├── games/
+│   ├── 1030840_Mafia__Definitive_Edition/
+│   │   ├── metadata.json           # Per-game metadata & sync timestamp
+│   │   ├── 1030840.lua             # LuaTools manifest (if managed)
+│   │   ├── appmanifest_1030840.acf # Steam official app manifest (if installed)
+│   │   └── manifests/              # Binary depot manifests
+│   ├── 1174180_Red_Dead_Redemption_2/
+│   ├── 268910_Cuphead/
+│   └── ...
+├── archives/                       # Standalone .tar.gz bundle exports
+│   └── backup_YYYY-MM-DD_HH-MM-SS.tar.gz
+└── index.json                      # Global synchronization registry
 ```
 
+* **Zero Duplication / Single Source:** Every sync creates or replaces the game's individual subdirectory.
+* **100% Dynamic:** Detects game titles and ownership dynamically from your running Steam client (`appStore.m_mapApps`). Zero hardcoded game titles.
+* **Lightweight:** Backs up only metadata (`.lua`, `.acf`, depot manifests) — typically **~100 KB total**. Never touches 100 GB game binaries.
+
 ---
 
-## 💻 Usage
+## 🖥️ In-Steam Interface
 
-### 1. Dedicated Web GUI
-Launch the local visual manager:
+A movable floating pill (**`⋮⋮ 📦 Backup & Restore`**) is rendered in your Steam client:
+* **Single-Screen Dashboard:** No separate backup and restore tabs.
+* **Per-Game Sync Timestamps:** Displays the exact timestamp when each game was last backed up.
+* **Global Sync:** Select any combination (or all) and click `🔄 Sync Selected`. Option to simultaneously generate a `.tar.gz` bundle.
+* **Interactive Restore Popup:** Click `📥 Restore...` to open a clean modal. Choose between your single-source directory (`games/`) or a `.tar.gz` archive, with all games pre-checked and selectable.
+
+---
+
+## 💻 CLI Usage
+
 ```bash
-steam-library-manager gui
-```
-Opens in your browser with full search, checkboxes, and one-click export/restore.
-
-### 2. Command Line (CLI)
-
-#### List All Games:
-```bash
+# List all games with sync timestamps
 steam-library-manager list
-```
 
-#### Export / Backup:
-```bash
-# Export whole library (all games)
-steam-library-manager export --all
+# Sync all games into their subdirectories
+steam-library-manager sync --all
 
-# Multi-select specific games by AppID
-steam-library-manager export --games 1174180,814380,2358720
+# Sync specific games by AppID (also create .tar.gz bundle)
+steam-library-manager sync --games 1030840,1174180 --tar
 
-# Export a single game
-steam-library-manager export --game 1174180
-```
+# Restore all games from the single-source directory
+steam-library-manager restore --dir --all
 
-#### List Available Backups:
-```bash
-steam-library-manager backups
-```
-
-#### Restore / Import:
-```bash
-# Restore all games from the latest backup
-steam-library-manager restore --all
-
-# Restore specific games from a backup
-steam-library-manager restore --backup steam_library_full_2026-10-12.zip --games 1174180,814380
-
-# Restore a single game from a backup
-steam-library-manager restore --backup steam_library_full_2026-10-12.zip --game 1174180
-
-# Import an individual .lua file directly into Steam
-steam-library-manager restore --file ~/Downloads/1174180.lua
-```
-
----
-
-## 📂 Project Structure
-
-```
-steam-library-manager/
-├── bin/
-│   └── steam-library-manager         # Standalone CLI, daemon, and Web GUI
-├── backend/
-│   └── main.py                       # Millennium backend engine
-├── frontend/
-│   ├── index.js                      # In-Steam modal UI & topbar injection
-│   └── styles.css                    # Steam dark theme stylesheet
-├── desktop/
-│   └── steam-library-manager.desktop # Application launcher
-├── plugin.json                       # Millennium plugin manifest
-├── install.sh                        # Installer script
-└── uninstall.sh                      # Clean removal script
+# Restore specific games from an archive bundle
+steam-library-manager restore --archive backup.tar.gz --games 1030840
 ```
 
 ---
