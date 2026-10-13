@@ -16,6 +16,24 @@
   const API_PORT = 8343;
   const BACKEND_URL = `http://127.0.0.1:${API_PORT}`;
 
+  function formatBytes(bytes) {
+    const value = Number(bytes);
+    if (!Number.isFinite(value) || value <= 0) return "0 B";
+
+    const units = ["KB", "MB", "GB", "TB", "PB", "EB"];
+    let size = value / 1024;
+    let unit = 0;
+    while (size >= 1024 && unit < units.length - 1) {
+      size /= 1024;
+      unit += 1;
+    }
+    if (Number(size.toFixed(1)) >= 1024 && unit < units.length - 1) {
+      size /= 1024;
+      unit += 1;
+    }
+    return `${size.toFixed(1)} ${units[unit]}`;
+  }
+
   async function apiCall(method, params = {}) {
     const endpointMap = {
       "get_games": "/api/games",
@@ -252,7 +270,7 @@
           if (g.source === "LuaTools / SLSsteam") srcClass = "luatools";
 
           let statusBadge = g.installed
-            ? `<span class="slm-badge installed">Installed${g.size_on_disk ? ' (' + (g.size_on_disk / 1e9).toFixed(1) + ' GB)' : ''}</span>`
+            ? `<span class="slm-badge installed">Installed${g.size_on_disk ? ' (' + formatBytes(g.size_on_disk) + ')' : ''}</span>`
             : `<span class="slm-badge library">In Library</span>`;
 
           let syncBadge = g.backed_up
@@ -388,7 +406,7 @@
 
       state.archives.forEach(a => {
         const tr = document.createElement("tr");
-        const sz = (a.size / 1024).toFixed(1) + " KB";
+        const sz = formatBytes(a.size);
         const dt = new Date(a.mtime * 1000).toLocaleString();
 
         tr.innerHTML = `

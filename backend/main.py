@@ -45,6 +45,25 @@ def resolve_repo_dir():
 
 REPO_DIR = resolve_repo_dir()
 
+def format_bytes(value):
+    try:
+        size = float(value)
+    except (TypeError, ValueError):
+        return "0 B"
+    if size <= 0:
+        return "0 B"
+
+    units = ("KB", "MB", "GB", "TB", "PB", "EB")
+    size /= 1024
+    unit = 0
+    while size >= 1024 and unit < len(units) - 1:
+        size /= 1024
+        unit += 1
+    if round(size, 1) >= 1024 and unit < len(units) - 1:
+        size /= 1024
+        unit += 1
+    return f"{size:.1f} {units[unit]}"
+
 os.makedirs(GAMES_BACKUP_DIR, exist_ok=True)
 os.makedirs(ARCHIVES_BACKUP_DIR, exist_ok=True)
 
@@ -918,9 +937,9 @@ def main():
         print("─" * 90)
         for g in games:
             st = "INSTALLED" if g["installed"] else "IN LIBRARY"
-            sz_str = f" ({g['size_on_disk'] / (1024**3):.1f} GB)" if g["installed"] and g.get("size_on_disk") else ""
+            sz_str = f" ({format_bytes(g['size_on_disk'])})" if g["installed"] and g.get("size_on_disk") else ""
             sync_st = f"SYNCED ({g['last_synced']})" if g["backed_up"] else "NOT SYNCED"
-            print(f"[{g['appid']:7d}] {g['name']:<38} | {st:<12} | {sync_st}")
+            print(f"[{g['appid']:7d}] {g['name']:<38} | {st:<12}{sz_str} | {sync_st}")
         print("─" * 90)
         return
 
@@ -952,7 +971,7 @@ def main():
             print("No archives found.")
         for a in archs:
             dt = datetime.fromtimestamp(a["mtime"]).strftime("%Y-%m-%d %H:%M:%S")
-            sz = f"{a['size'] / 1024:.1f} KB"
+            sz = format_bytes(a["size"])
             print(f"{a['filename']:<48} {a['count']:2d} games | {sz} | {dt}")
         print("─" * 80)
 

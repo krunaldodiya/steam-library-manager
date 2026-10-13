@@ -52,6 +52,7 @@ Unlike utilities that produce opaque, monolithic archives, **Steam Library Manag
 
 A movable floating pill (**`⋮⋮ 📦 Backup & Restore`**) is rendered in your Steam client:
 * **Single-Screen Dashboard:** No separate backup and restore tabs.
+* **Dynamic File Sizes:** Installed game and archive sizes scale through KB, MB, GB, TB, and larger units.
 * **Per-Game Sync Timestamps:** Displays the exact timestamp when each game was last backed up.
 * **Global Sync:** Select any combination (or all) and click `🔄 Sync Selected`. Option to simultaneously generate a `.tar.gz` bundle.
 * **Interactive Restore Popup:** Click `📥 Restore...` to open a clean modal. Choose between your single-source directory (`games/`) or a `.tar.gz` archive, with all games pre-checked and selectable.
