@@ -1,6 +1,24 @@
 # 🎮 Steam Library Manager
 
-A dedicated, standalone Steam plugin, CLI, and engine for managing, backing up, and restoring Steam games metadata.
+A Linux Steam library backup manager with a floating in-client interface, CLI, and automatic Steam startup integration.
+
+---
+
+## Install and automatic startup
+
+Requirements: Linux with a systemd user session, Steam running with Lumen's CEF remote-debugging endpoint enabled, and Node.js 22 or newer.
+
+```bash
+git clone https://github.com/krunaldodiya/steam-library-manager.git
+cd steam-library-manager
+bash install.sh
+```
+
+The installer copies the app and frontend assets into `~/.local/share/steam-library-manager`, installs the CLI and desktop launcher, and enables `steam-library-manager.service` for the current user. The service starts at user login, waits for Steam's CEF page, and injects the interface automatically; no AI agent or manual injection command is needed. It retries after Steam starts or restarts.
+
+Check the service with `systemctl --user status steam-library-manager.service`. To update an existing installation, pull the new revision and rerun `bash install.sh`. To remove the app and service, run `bash uninstall.sh`; game files and backups are not removed.
+
+This is a Linux sidecar integration using Lumen/Steam CEF remote debugging, not a Steam-supported native plugin API or a Millennium plugin. The service must be running, Lumen's CDP endpoint must be available, and Node.js must be on the PATH captured by the installer.
 
 ---
 

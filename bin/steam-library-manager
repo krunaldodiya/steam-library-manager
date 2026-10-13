@@ -32,7 +32,18 @@ GAMES_BACKUP_DIR = os.path.join(DEFAULT_BACKUP_DIR, "games")
 ARCHIVES_BACKUP_DIR = os.path.join(DEFAULT_BACKUP_DIR, "archives")
 INDEX_FILE = os.path.join(DEFAULT_BACKUP_DIR, "index.json")
 NAMES_CACHE_FILE = os.path.expanduser("~/.config/steam-library-manager/names_cache.json")
-REPO_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+def resolve_repo_dir():
+    configured = os.environ.get("STEAM_LIBRARY_MANAGER_HOME")
+    if configured:
+        return os.path.abspath(os.path.expanduser(configured))
+
+    script_dir = Path(__file__).resolve().parent
+    for candidate in (script_dir.parent, script_dir):
+        if (candidate / "frontend" / "index.js").is_file() and (candidate / "frontend" / "styles.css").is_file():
+            return str(candidate)
+    return str(script_dir.parent)
+
+REPO_DIR = resolve_repo_dir()
 
 os.makedirs(GAMES_BACKUP_DIR, exist_ok=True)
 os.makedirs(ARCHIVES_BACKUP_DIR, exist_ok=True)
@@ -649,60 +660,97 @@ def inject_into_steam():
     port = None
     if os.path.exists(port_file):
         try:
-            with open(port_file, "r") as f:
-                port = f.read().split("\n")[0].strip()
+            with open(port_file, "r", encoding="utf-8") as f:
+                port = f.read().splitlines()[0].strip()
         except Exception:
             pass
 
     if not port:
         try:
-            out = subprocess.check_output(["pgrep", "-a", "steamwebhelper"]).decode()
-            m = re.search(r'--remote-debugging-port=(\d+)', out)
-            if m: port = m.group(1)
+            out = subprocess.check_output(["pgrep", "-a", "steamwebhelper"], text=True)
+            match = re.search(r'--remote-debugging-port=(\d+)', out)
+            if match:
+                port = match.group(1)
         except Exception:
             pass
 
-    if not port:
-        return False, "Could not locate Steam remote debugging port"
+    if not port or not port.isdigit():
+        return False, "Waiting for a Steam CDP port; start Lumen or Steam with remote debugging enabled"
+
+    css_path = os.path.join(REPO_DIR, "frontend", "styles.css")
+    js_path = os.path.join(REPO_DIR, "frontend", "index.js")
+    if not os.path.isfile(css_path) or not os.path.isfile(js_path):
+        return False, f"Frontend assets missing under {REPO_DIR}"
 
     node_script = f"""
     const fs = require('fs');
-    const path = '{REPO_DIR}';
-    const css = fs.readFileSync(path + '/frontend/styles.css', 'utf8');
-    const js = fs.readFileSync(path + '/frontend/index.js', 'utf8');
+    const root = {json.dumps(REPO_DIR)};
+    const port = {int(port)};
+    const css = fs.readFileSync(root + '/frontend/styles.css', 'utf8');
+    const js = fs.readFileSync(root + '/frontend/index.js', 'utf8');
+
+    function fail(message) {{
+      console.error(message);
+      process.exit(1);
+    }}
 
     async function run() {{
-      const res = await fetch('http://127.0.0.1:{port}/json');
-      const pages = await res.json();
-      const steam = pages.find(p => p.title === 'Steam');
-      if (!steam) return process.exit(1);
+      const response = await fetch(`http://127.0.0.1:${{port}}/json`);
+      if (!response.ok) return fail(`Steam CDP returned HTTP ${{response.status}}`);
+      const pages = await response.json();
+      const steam = pages.find(page => page.title === 'Steam' && page.webSocketDebuggerUrl);
+      if (!steam) return fail('Steam main CEF page is not ready yet');
 
       const ws = new WebSocket(steam.webSocketDebuggerUrl);
+      const timeout = setTimeout(() => fail('Timed out waiting for Steam CEF'), 6000);
       ws.onopen = () => {{
-        const code = `
+        const expression = `
           (function() {{
             const oldStyles = document.getElementById('slm-styles');
             if (oldStyles) oldStyles.remove();
-            const s = document.createElement('style');
-            s.id = 'slm-styles';
-            s.textContent = ${{JSON.stringify(css)}};
-            document.head.appendChild(s);
+            const styles = document.createElement('style');
+            styles.id = 'slm-styles';
+            styles.textContent = ${{JSON.stringify(css)}};
+            document.head.appendChild(styles);
             ${{js}}
             return true;
           }})()
         `;
-        ws.send(JSON.stringify({{ id: 1, method: 'Runtime.evaluate', params: {{ expression: code, returnByValue: true }} }}));
+        ws.send(JSON.stringify({{
+          id: 1,
+          method: 'Runtime.evaluate',
+          params: {{ expression, returnByValue: true }}
+        }}));
       }};
-      ws.onmessage = () => process.exit(0);
-      ws.onerror = () => process.exit(1);
+      ws.onmessage = event => {{
+        const message = JSON.parse(event.data);
+        if (message.id !== 1) return;
+        clearTimeout(timeout);
+        if (message.error) return fail(message.error.message || 'Steam rejected the injection');
+        if (message.result && message.result.exceptionDetails) {{
+          return fail(message.result.exceptionDetails.text || 'Steam frontend injection failed');
+        }}
+        console.log('Injected into Steam');
+        ws.close();
+        process.exit(0);
+      }};
+      ws.onerror = () => fail('Could not connect to Steam CEF');
     }}
-    run();
+
+    run().catch(error => fail(error.message || String(error)));
     """
     try:
-        res = subprocess.run(["node", "-e", node_script], capture_output=True, timeout=5)
-        return res.returncode == 0, "Injected"
-    except Exception as e:
-        return False, str(e)
+        result = subprocess.run(["node", "-e", node_script], capture_output=True, text=True, timeout=8)
+        if result.returncode == 0:
+            return True, "Injected into Steam"
+        message = (result.stderr or result.stdout).strip()
+        return False, message or f"Node injector exited with status {result.returncode}"
+    except FileNotFoundError:
+        return False, "Node.js 22 or newer is required for Steam CEF injection"
+    except subprocess.TimeoutExpired:
+        return False, "Steam CEF injection timed out"
+    except Exception as error:
+        return False, str(error)
 
 # HTTP Request Handler with CORS
 class RequestHandler(http.server.BaseHTTPRequestHandler):
@@ -803,23 +851,38 @@ def run_server(port=8343):
     server.serve_forever()
 
 def run_daemon(port=8343):
-    print(f"[SLM Daemon] Starting single-source daemon on 127.0.0.1:{port}...")
-    t = threading.Thread(target=run_server, args=(port,), daemon=True)
-    t.start()
+    print(f"[SLM Daemon] Starting auto-attach service on 127.0.0.1:{port}...", flush=True)
+    server_thread = threading.Thread(target=run_server, args=(port,), daemon=True)
+    server_thread.start()
 
-    last_injected = 0
+    next_attempt = 0
+    last_status_log = 0
+    attached = False
     while True:
         try:
             time.sleep(3)
-            now = time.time()
-            if now - last_injected > 5:
-                ok, _ = inject_into_steam()
+            now = time.monotonic()
+            if now >= next_attempt:
+                ok, message = inject_into_steam()
                 if ok:
-                    last_injected = now
+                    next_attempt = now + 30
+                    if not attached:
+                        print(f"[SLM Daemon] {message}", flush=True)
+                    attached = True
+                    last_status_log = now
+                else:
+                    next_attempt = now + 5
+                    attached = False
+                    if now - last_status_log >= 30:
+                        last_status_log = now
+                        print(f"[SLM Daemon] Waiting to attach: {message}", flush=True)
         except KeyboardInterrupt:
             break
-        except Exception:
-            pass
+        except Exception as error:
+            now = time.monotonic()
+            if now - last_status_log >= 30:
+                last_status_log = now
+                print(f"[SLM Daemon] Auto-attach error: {error}", flush=True)
 
 def main():
     parser = argparse.ArgumentParser(description="Steam Library Manager - Single Source of Truth Backup & Restore")

@@ -1,7 +1,7 @@
 [Desktop Entry]
 Name=Steam Library Manager
-Comment=Backup and Restore SLSsteam / LuaTools game metadata
-Exec=python3 /home/krunaldodiya/WorkSpace/Code/steam-library-manager/bin/steam-library-manager gui
+Comment=Back up and restore Steam library metadata
+Exec=steam-library-manager gui
 Icon=steam
 Terminal=false
 Type=Application

@@ -5,6 +5,9 @@
  */
 
 (function () {
+  if (window.__steamLibraryManagerInitialized) return;
+  window.__steamLibraryManagerInitialized = true;
+
   const prevBtn = document.getElementById("slm-topbar-btn");
   if (prevBtn) prevBtn.remove();
   const prevFloat = document.getElementById("slm-floating-btn");
