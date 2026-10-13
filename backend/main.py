@@ -590,7 +590,32 @@ def restore_games(source_type="directory", archive_path=None, appids=None):
 
     if archive_path.endswith(".tar.gz") or archive_path.endswith(".tgz") or archive_path.endswith(".tar"):
         with tarfile.open(archive_path, "r:*") as tar:
-            for member in tar.getmembers():
+            members = tar.getmembers()
+            selected_manifest_members = None
+            if target_appids is not None:
+                selected_manifest_members = set()
+                for metadata_member in members:
+                    if not metadata_member.isfile() or os.path.basename(metadata_member.name) != "metadata.json":
+                        continue
+                    metadata_file = tar.extractfile(metadata_member)
+                    if not metadata_file:
+                        continue
+                    try:
+                        metadata = json.loads(metadata_file.read().decode("utf-8"))
+                        metadata_appid = int(metadata.get("appid", 0))
+                    except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
+                        continue
+                    if metadata_appid not in target_appids:
+                        continue
+                    game_dir = os.path.normpath(os.path.dirname(metadata_member.name))
+                    for saved_file in metadata.get("files", []):
+                        if not isinstance(saved_file, str) or not saved_file.startswith("manifests/"):
+                            continue
+                        manifest_path = os.path.normpath(os.path.join(game_dir, saved_file))
+                        if manifest_path.startswith(game_dir + os.sep):
+                            selected_manifest_members.add(manifest_path)
+
+            for member in members:
                 if not member.isfile(): continue
                 bname = os.path.basename(member.name)
 
@@ -622,8 +647,11 @@ def restore_games(source_type="directory", archive_path=None, appids=None):
                             if not any(r["appid"] == aid for r in restored):
                                 restored.append({"appid": aid, "name": f"AppID {aid}"})
 
-                # Check if it's a depot manifest
+                # Check if it's a depot manifest owned by one of the selected games
                 elif bname.endswith(".manifest"):
+                    if (selected_manifest_members is not None and
+                            os.path.normpath(member.name) not in selected_manifest_members):
+                        continue
                     f = tar.extractfile(member)
                     if f:
                         with open(os.path.join(manifests_dir, bname), "wb") as out:

@@ -77,7 +77,11 @@
       activeTab: "backup",
       activeFilter: "all",
       games: [],
-      archives: []
+      archives: [],
+      restoreSourceName: "directory",
+      restoreGames: [],
+      restoreSelectedIds: new Set(),
+      restoreRequestId: 0
     };
 
     const overlay = document.createElement("div");
@@ -353,255 +357,255 @@
 
     // ── 2. Restore Screen ───────────────────────────────────────────────────────
     function renderRestoreScreen() {
+      if (state.restoreSourceName !== "directory" &&
+          !state.archives.some(a => `archive:${a.filename}` === state.restoreSourceName)) {
+        state.restoreSourceName = "directory";
+      }
+
+      const archiveOptions = state.archives.map(a =>
+        `<option value="archive:${a.filename}">${a.filename} (${a.count} games)</option>`
+      ).join("");
+
       content.innerHTML = `
         <div class="slm-toolbar" style="justify-content:space-between;">
           <div>
-            <h3 style="margin:0;color:#fff;font-size:15px;">Available Backup Archives</h3>
-            <small style="color:#8f98a0;">Select an archive below to choose games and restore.</small>
+            <h3 style="margin:0;color:#fff;font-size:15px;">Games Available to Restore</h3>
+            <small style="color:#8f98a0;">Choose a backup source, then select one or more games.</small>
           </div>
-          <button class="slm-btn-secondary" id="slm-refresh-archives">🔄 Refresh</button>
+          <div style="display:flex;gap:8px;align-items:center;">
+            <select id="slm-restore-source" class="slm-input" style="max-width:420px;">
+              <option value="directory">📁 Uncompressed games directory</option>
+              ${archiveOptions}
+            </select>
+            <button class="slm-btn-secondary" id="slm-refresh-restore">🔄 Refresh</button>
+          </div>
+        </div>
+
+        <div class="slm-toolbar">
+          <input type="text" id="slm-restore-search" class="slm-input" placeholder="🔍 Search games or AppID...">
+          <button class="slm-btn-primary" id="slm-restore-selected" disabled style="opacity:0.4;cursor:not-allowed;">
+            <span>📥</span><span>Restore Selected (<span id="slm-restore-count">0</span>)</span>
+          </button>
         </div>
 
         <table class="slm-table">
           <thead>
             <tr>
-              <th>Backup Archive</th>
-              <th width="100">Games</th>
-              <th width="110">Size</th>
-              <th width="180">Created</th>
-              <th width="180">Actions</th>
+              <th width="32"><input type="checkbox" id="slm-restore-all" aria-label="Select all visible games"></th>
+              <th>Game Title</th>
+              <th width="100">AppID</th>
+              <th width="160">Source / Type</th>
+              <th>Target Restore Location</th>
             </tr>
           </thead>
-          <tbody id="slm-archives-body"></tbody>
+          <tbody id="slm-restore-games">
+            <tr><td colspan="5" style="text-align:center;padding:30px;color:#8f98a0;">Loading available games...</td></tr>
+          </tbody>
         </table>
-      `;
 
-      const tbody = content.querySelector("#slm-archives-body");
-      content.querySelector("#slm-refresh-archives").addEventListener("click", loadData);
-
-      // Add Single Source Directory Entry at top
-      const dirTr = document.createElement("tr");
-      dirTr.style.background = "rgba(26, 159, 255, 0.05)";
-      const syncedCount = state.games.filter(g => g.backed_up).length;
-      dirTr.innerHTML = `
-        <td style="font-weight:600;color:#fff;">📁 Single Source Directory (games/)</td>
-        <td>${syncedCount} games</td>
-        <td style="color:#8f98a0;">Uncompressed</td>
-        <td style="color:#8f98a0;">Live on disk</td>
-        <td>
-          <button class="slm-btn-primary" style="padding:4px 12px;font-size:11px;" id="slm-res-dir">📥 Restore...</button>
-        </td>
-      `;
-      dirTr.querySelector("#slm-res-dir").addEventListener("click", () => {
-        openInteractivePickerModal({ filename: "Single Source Directory (games/)", isDir: true });
-      });
-      tbody.appendChild(dirTr);
-
-      if (!state.archives || state.archives.length === 0) {
-        const noTr = document.createElement("tr");
-        noTr.innerHTML = `<td colspan="5" style="text-align:center;padding:24px;color:#8f98a0;">No standalone archive bundles found in archives/. Click Backup to generate one.</td>`;
-        tbody.appendChild(noTr);
-        return;
-      }
-
-      state.archives.forEach(a => {
-        const tr = document.createElement("tr");
-        const sz = formatBytes(a.size);
-        const dt = new Date(a.mtime * 1000).toLocaleString();
-
-        tr.innerHTML = `
-          <td style="font-weight:600;color:#fff;">${a.filename}</td>
-          <td>${a.count} games</td>
-          <td style="color:#8f98a0;">${sz}</td>
-          <td style="color:#8f98a0;">${dt}</td>
-          <td>
-            <button class="slm-btn-primary" style="padding:4px 12px;font-size:11px;" data-action="pick">📥 Restore...</button>
-            <button class="slm-btn-danger" style="padding:4px 8px;font-size:11px;margin-left:6px;" data-action="del" title="Delete this archive">🗑 Delete</button>
-          </td>
-        `;
-
-        // Restore Button opens the Interactive Picker Popup!
-        tr.querySelector("[data-action='pick']").addEventListener("click", () => {
-          openInteractivePickerModal(a);
-        });
-
-        // 2-step inline confirm for Delete ("Sure?" prompt)
-        const btnDel = tr.querySelector("[data-action='del']");
-        let deleteArmed = false;
-        let deleteTimer = null;
-        btnDel.addEventListener("click", async () => {
-          if (!deleteArmed) {
-            deleteArmed = true;
-            btnDel.textContent = "Sure?";
-            btnDel.style.background = "#ec5c5c";
-            btnDel.style.color = "#ffffff";
-            deleteTimer = setTimeout(() => {
-              deleteArmed = false;
-              btnDel.textContent = "🗑 Delete";
-              btnDel.style.background = "rgba(236, 92, 92, 0.12)";
-              btnDel.style.color = "#f28b82";
-            }, 4000);
-            return;
-          }
-
-          clearTimeout(deleteTimer);
-          btnDel.disabled = true;
-          btnDel.textContent = "Deleting...";
-          const res = await apiCall("delete_archive", { filename: a.filename });
-          if (res.success) {
-            showToast(`✓ Permanently deleted ${a.filename}`);
-            loadData();
-          } else {
-            showToast(`✗ Delete failed: ${res.error || 'Unknown error'}`);
-          }
-        });
-
-        tbody.appendChild(tr);
-      });
-    }
-
-    // ── 3. Interactive Restore Picker Popup ─────────────────────────────────────
-    async function openInteractivePickerModal(sourceItem) {
-      const existingPop = document.getElementById("slm-restore-popup");
-      if (existingPop) existingPop.remove();
-
-      const pop = document.createElement("div");
-      pop.id = "slm-restore-popup";
-      pop.style.cssText = `
-        position: absolute; top: 0; left: 0; right: 0; bottom: 0;
-        background: rgba(15, 18, 24, 0.96); z-index: 1000;
-        display: flex; flex-direction: column; padding: 22px 26px;
-      `;
-
-      const sourceName = sourceItem.filename;
-      const isDir = !!sourceItem.isDir;
-
-      pop.innerHTML = `
-        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom: 16px; border-bottom:1px solid #282f3c; padding-bottom:12px;">
-          <div>
-            <h3 style="margin:0;color:#fff;font-size:17px;display:flex;align-items:center;gap:8px;">
-              <span>📥</span><span>Select Games to Restore</span>
-            </h3>
-            <small style="color:#8f98a0;">From: ${sourceName}</small>
-          </div>
-          <button id="slm-pop-close" class="slm-header-close">✕</button>
-        </div>
-
-        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
-          <span style="font-size:12px;color:#8f98a0;">All games are checked by default. Uncheck any games you wish to skip.</span>
-          <button id="slm-pop-confirm" class="slm-btn-primary" style="background:#2874a6;">
-            <span>📥</span><span>Restore Selected (<span id="slm-pop-count">0</span> Games)</span>
-          </button>
-        </div>
-
-        <div style="flex:1; overflow-y:auto; border:1px solid #252b36; border-radius:6px; background:#14171f;">
-          <table class="slm-table">
+        <details style="margin-top:14px;">
+          <summary style="color:#8f98a0;cursor:pointer;">Manage backup archives (${state.archives.length})</summary>
+          <table class="slm-table" style="margin-top:8px;">
             <thead>
               <tr>
-                <th width="32"><input type="checkbox" id="slm-pop-th-chk" checked></th>
-                <th>Game Title</th>
-                <th width="100">AppID</th>
-                <th width="160">Source / Type</th>
-                <th>Target Restore Location</th>
+                <th>Backup Archive</th>
+                <th width="100">Games</th>
+                <th width="110">Size</th>
+                <th width="180">Created</th>
+                <th width="100">Actions</th>
               </tr>
             </thead>
-            <tbody id="slm-pop-body">
-              <tr><td colspan="5" style="text-align:center;padding:30px;color:#8f98a0;">Inspecting games in backup...</td></tr>
-            </tbody>
+            <tbody id="slm-archives-body"></tbody>
           </table>
-        </div>
+        </details>
       `;
 
-      win.appendChild(pop);
+      const sourceSelect = content.querySelector("#slm-restore-source");
+      const search = content.querySelector("#slm-restore-search");
+      const restoreAll = content.querySelector("#slm-restore-all");
+      const restoreBody = content.querySelector("#slm-restore-games");
+      const restoreButton = content.querySelector("#slm-restore-selected");
+      const archiveBody = content.querySelector("#slm-archives-body");
+      sourceSelect.value = state.restoreSourceName;
 
-      const popClose = pop.querySelector("#slm-pop-close");
-      const popBody = pop.querySelector("#slm-pop-body");
-      const popCount = pop.querySelector("#slm-pop-count");
-      const popConfirm = pop.querySelector("#slm-pop-confirm");
-      const popThChk = pop.querySelector("#slm-pop-th-chk");
+      function updateSelectionControls() {
+        const visible = Array.from(restoreBody.querySelectorAll(".slm-restore-check"));
+        const selectedVisible = visible.filter(c => state.restoreSelectedIds.has(Number(c.value))).length;
+        restoreAll.checked = visible.length > 0 && selectedVisible === visible.length;
+        restoreAll.indeterminate = selectedVisible > 0 && selectedVisible < visible.length;
+        const count = state.restoreSelectedIds.size;
+        restoreButton.innerHTML = `<span>📥</span><span>Restore Selected (${count})</span>`;
+        restoreButton.disabled = count === 0;
+        restoreButton.style.opacity = restoreButton.disabled ? "0.4" : "1";
+        restoreButton.style.cursor = restoreButton.disabled ? "not-allowed" : "pointer";
+      }
 
-      popClose.addEventListener("click", () => pop.remove());
+      function renderGames(query = "") {
+        const normalizedQuery = query.trim().toLowerCase();
+        const games = state.restoreGames.filter(g =>
+          String(g.name || "").toLowerCase().includes(normalizedQuery) ||
+          String(g.appid || "").includes(normalizedQuery) ||
+          String(g.source || "").toLowerCase().includes(normalizedQuery)
+        );
 
-      function updateCount() {
-        const chks = popBody.querySelectorAll(".slm-pop-chk");
-        const checkedChks = popBody.querySelectorAll(".slm-pop-chk:checked");
-        const n = checkedChks.length;
-        popCount.textContent = n;
-        if (popThChk && chks.length > 0) {
-          popThChk.checked = checkedChks.length === chks.length;
-          popThChk.indeterminate = n > 0 && n < chks.length;
+        if (games.length === 0) {
+          const message = state.restoreGames.length === 0
+            ? "No games found in this backup source."
+            : "No games match your search.";
+          restoreBody.innerHTML = `<tr><td colspan="5" style="text-align:center;padding:30px;color:#8f98a0;">${message}</td></tr>`;
+          updateSelectionControls();
+          return;
         }
-        if (n > 0) {
-          popConfirm.disabled = false;
-          popConfirm.style.opacity = "1";
-          popConfirm.style.cursor = "pointer";
-        } else {
-          popConfirm.disabled = true;
-          popConfirm.style.opacity = "0.4";
-          popConfirm.style.cursor = "not-allowed";
+
+        restoreBody.innerHTML = "";
+        games.forEach(g => {
+          const tr = document.createElement("tr");
+          const appid = Number(g.appid);
+          const target = g.installed ? "steamapps/ & stplug-in/" : "config/stplug-in/";
+          tr.innerHTML = `
+            <td><input type="checkbox" class="slm-restore-check" value="${appid}" aria-label="Select ${g.name}"></td>
+            <td style="font-weight:600;color:#fff;">${g.name}</td>
+            <td style="color:#8f98a0;">${appid}</td>
+            <td><span class="slm-badge official">${g.source || "Steam"}</span></td>
+            <td style="color:#8f98a0;font-size:12px;">${target}</td>
+          `;
+          const checkbox = tr.querySelector(".slm-restore-check");
+          checkbox.checked = state.restoreSelectedIds.has(appid);
+          checkbox.addEventListener("change", () => {
+            if (checkbox.checked) state.restoreSelectedIds.add(appid);
+            else state.restoreSelectedIds.delete(appid);
+            updateSelectionControls();
+          });
+          restoreBody.appendChild(tr);
+        });
+        updateSelectionControls();
+      }
+
+      async function loadRestoreGames() {
+        const requestId = ++state.restoreRequestId;
+        state.restoreSourceName = sourceSelect.value;
+        state.restoreGames = [];
+        state.restoreSelectedIds = new Set();
+        restoreBody.innerHTML = `<tr><td colspan="5" style="text-align:center;padding:30px;color:#8f98a0;">Loading available games...</td></tr>`;
+        updateSelectionControls();
+
+        const isDirectory = state.restoreSourceName === "directory";
+        const archive = isDirectory
+          ? null
+          : state.archives.find(a => `archive:${a.filename}` === state.restoreSourceName);
+        if (!isDirectory && !archive) {
+          restoreBody.innerHTML = `<tr><td colspan="5" style="text-align:center;padding:30px;color:#ec5c5c;">Selected archive is no longer available. Refresh the list.</td></tr>`;
+          return;
+        }
+
+        try {
+          const result = await apiCall("inspect", {
+            source_type: isDirectory ? "directory" : "archive",
+            archive_path: archive ? archive.path : null
+          });
+          if (requestId !== state.restoreRequestId) return;
+          if (!result.success) throw new Error(result.error || "Could not inspect backup source");
+          state.restoreGames = result.games || [];
+          renderGames(search.value);
+        } catch (error) {
+          if (requestId !== state.restoreRequestId) return;
+          restoreBody.innerHTML = `<tr><td colspan="5" style="text-align:center;padding:30px;color:#ec5c5c;">Could not load games: ${error.message}</td></tr>`;
+          updateSelectionControls();
         }
       }
 
-      const res = await apiCall("inspect", {
-        source_type: isDir ? "directory" : "archive",
-        archive_path: isDir ? null : sourceItem.path
+      sourceSelect.addEventListener("change", loadRestoreGames);
+      search.addEventListener("input", () => renderGames(search.value));
+      restoreAll.addEventListener("change", () => {
+        restoreBody.querySelectorAll(".slm-restore-check").forEach(checkbox => {
+          const appid = Number(checkbox.value);
+          if (restoreAll.checked) state.restoreSelectedIds.add(appid);
+          else state.restoreSelectedIds.delete(appid);
+        });
+        renderGames(search.value);
       });
-      const games = res.games || [];
+      content.querySelector("#slm-refresh-restore").addEventListener("click", loadData);
 
-      if (games.length === 0) {
-        popBody.innerHTML = `<tr><td colspan="5" style="text-align:center;padding:30px;color:#8f98a0;">No game metadata found in selected source.</td></tr>`;
-        updateCount();
-        return;
-      }
+      restoreButton.addEventListener("click", async () => {
+        const appids = Array.from(state.restoreSelectedIds);
+        if (appids.length === 0) return;
+        const isDirectory = state.restoreSourceName === "directory";
+        const archive = isDirectory
+          ? null
+          : state.archives.find(a => `archive:${a.filename}` === state.restoreSourceName);
+        if (!isDirectory && !archive) {
+          showToast("✗ Selected archive is no longer available. Refresh the list.");
+          return;
+        }
 
-      popBody.innerHTML = "";
-      games.forEach(g => {
-        const tr = document.createElement("tr");
-        const targetLoc = g.installed ? "steamapps/ & stplug-in/" : "config/stplug-in/";
-
-        tr.innerHTML = `
-          <td><input type="checkbox" class="slm-pop-chk" value="${g.appid}" checked></td>
-          <td style="font-weight:600;color:#fff;">${g.name}</td>
-          <td style="color:#8f98a0;">${g.appid}</td>
-          <td><span class="slm-badge official">${g.source || 'Steam'}</span></td>
-          <td style="color:#8f98a0;font-size:12px;">${targetLoc}</td>
-        `;
-
-        tr.querySelector(".slm-pop-chk").addEventListener("change", updateCount);
-        popBody.appendChild(tr);
+        restoreButton.disabled = true;
+        restoreButton.innerHTML = "<span>📥</span><span>Restoring...</span>";
+        try {
+          const result = await apiCall("restore", {
+            source_type: isDirectory ? "directory" : "archive",
+            archive_path: archive ? archive.path : null,
+            appids
+          });
+          if (result.success) {
+            showToast(`✓ Restored ${result.restored_count} games from ${result.source}! Restart Steam to apply.`);
+            loadData();
+          } else {
+            showToast(`✗ Restore failed: ${result.error || "Unknown error"}`);
+            updateSelectionControls();
+          }
+        } catch (error) {
+          showToast(`✗ Restore failed: ${error.message}`);
+          updateSelectionControls();
+        }
       });
 
-      if (popThChk) popThChk.checked = true;
-      updateCount();
+      if (state.archives.length === 0) {
+        archiveBody.innerHTML = `<tr><td colspan="5" style="text-align:center;padding:20px;color:#8f98a0;">No archive bundles available.</td></tr>`;
+      } else {
+        state.archives.forEach(a => {
+          const tr = document.createElement("tr");
+          const created = new Date(a.mtime * 1000).toLocaleString();
+          tr.innerHTML = `
+            <td style="font-weight:600;color:#fff;">${a.filename}</td>
+            <td>${a.count} games</td>
+            <td style="color:#8f98a0;">${formatBytes(a.size)}</td>
+            <td style="color:#8f98a0;">${created}</td>
+            <td><button class="slm-btn-danger" style="padding:4px 8px;font-size:11px;" data-action="delete" title="Delete this archive">🗑 Delete</button></td>
+          `;
+          const deleteButton = tr.querySelector("[data-action='delete']");
+          let deleteArmed = false;
+          let deleteTimer = null;
+          deleteButton.addEventListener("click", async () => {
+            if (!deleteArmed) {
+              deleteArmed = true;
+              deleteButton.textContent = "Sure?";
+              deleteButton.style.background = "#ec5c5c";
+              deleteButton.style.color = "#ffffff";
+              deleteTimer = setTimeout(() => {
+                deleteArmed = false;
+                deleteButton.textContent = "🗑 Delete";
+                deleteButton.style.background = "rgba(236, 92, 92, 0.12)";
+                deleteButton.style.color = "#f28b82";
+              }, 4000);
+              return;
+            }
 
-
-      if (popThChk) {
-        popThChk.addEventListener("change", () => {
-          popBody.querySelectorAll(".slm-pop-chk").forEach(c => c.checked = popThChk.checked);
-          updateCount();
+            clearTimeout(deleteTimer);
+            deleteButton.disabled = true;
+            deleteButton.textContent = "Deleting...";
+            const result = await apiCall("delete_archive", { filename: a.filename });
+            if (result.success) {
+              showToast(`✓ Permanently deleted ${a.filename}`);
+              loadData();
+            } else {
+              showToast(`✗ Delete failed: ${result.error || "Unknown error"}`);
+            }
+          });
+          archiveBody.appendChild(tr);
         });
       }
 
-      popConfirm.addEventListener("click", async () => {
-        const chosen = Array.from(popBody.querySelectorAll(".slm-pop-chk:checked")).map(c => parseInt(c.value));
-        if (chosen.length === 0) return;
-
-        popConfirm.disabled = true;
-        popConfirm.innerHTML = "<span>📥</span><span>Restoring...</span>";
-        const rRes = await apiCall("restore", {
-          source_type: isDir ? "directory" : "archive",
-          archive_path: isDir ? null : sourceItem.path,
-          appids: chosen
-        });
-        pop.remove();
-
-        if (rRes.success) {
-          showToast(`✓ Restored ${rRes.restored_count} games from ${rRes.source}! Restart Steam to apply.`);
-          loadData();
-        } else {
-          showToast(`✗ Restore failed: ${rRes.error}`);
-        }
-      });
+      loadRestoreGames();
     }
 
     loadData();
